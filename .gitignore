@@ -1,0 +1,24 @@
+# Kbuild output
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+
+# Userspace build output
+test_eg
+
+# The 2.6 build generated this on every build with `date`; the port does not
+# use it, but ignore it so an old tree does not commit one.
+eg_date.h
+
+# Editor and OS noise
+*~
+*.swp
+.DS_Store
