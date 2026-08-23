@@ -320,6 +320,7 @@ struct eg_dev {
 	void __iomem		*bar;		/* register block */
 	void __iomem		*wishbone;	/* wishbone bridge, or NULL */
 	int			bar_no;
+	int			bar_mask;	/* BARs claimed, for release */
 	const char		*bar_name;
 	resource_size_t		hw_addr;
 	resource_size_t		region_size;

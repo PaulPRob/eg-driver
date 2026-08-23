@@ -87,7 +87,9 @@
  *  7. probe() ignored pci_enable_device()'s return value, never called
  *     pci_request_regions(), and had no failure path.  The real setup ran from
  *     module_init *after* pci_register_driver() returned, so on a machine with
- *     no card it happily carried on and dereferenced a NULL mapping.
+ *     no card it happily carried on and dereferenced a NULL mapping.  It now
+ *     enables and claims memory BARs only - see the comment in probe(); the
+ *     PLX's unused I/O BAR must not be able to fail the bind.
  *
  *  8. remove() was an empty "return;".  Unloading the module left the IRQ
  *     registered, the BAR mapped and the char devices live.
@@ -2364,25 +2366,49 @@ static int eg_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	    pdev->device == WISHBONE_DEVICE_ID) {
 		dev->bar_no = WISHBONE_BAR;
 		dev->bar_name = WISHBONE_STRING;
+		dev->bar_mask = (1 << WISHBONE_BAR) | (1 << WISHBONE_CONFIG_BAR);
 	} else {
 		dev->bar_no = PLX_BAR;
 		dev->bar_name = PLX_STRING;
+		dev->bar_mask = (1 << PLX_BAR);
 	}
 
 	pr_info(EG_DRV_NAME ": probing %s (%04x:%04x) behind %s\n",
 		pci_name(pdev), dev->vendor, dev->device, dev->bar_name);
 
-	ret = pci_enable_device(pdev);
+	/*
+	 * pci_enable_device_mem(), not pci_enable_device().  The PLX 9030
+	 * exposes an I/O BAR (BAR1, 128 ports) that this driver never touches -
+	 * every register access is memory-mapped through BAR2.  pci_enable_
+	 * device() validates *every* BAR and fails the whole probe if any one
+	 * of them is unassigned:
+	 *
+	 *	can't enable device: BAR 1 [io size=0x80] not assigned
+	 *
+	 * On this card's usual home - a PCI slot, or a PCIe-to-PCI bridge whose
+	 * I/O window the firmware filled in - BAR1 is assigned and the question
+	 * never comes up.  Behind a bridge on a machine that hands out little or
+	 * no I/O space below a PCIe root port it is not, and the driver would
+	 * refuse to bind over a BAR it has no use for.  The _mem variant looks
+	 * only at the memory BARs.
+	 */
+	ret = pci_enable_device_mem(pdev);
 	if (ret) {
-		dev_err(&pdev->dev, EG_DRV_NAME ": pci_enable_device failed (%d)\n",
+		dev_err(&pdev->dev, EG_DRV_NAME ": pci_enable_device_mem failed (%d)\n",
 			ret);
 		goto err_free;
 	}
 
-	ret = pci_request_regions(pdev, EG_DRV_NAME);
+	/*
+	 * Likewise claim only the BARs actually mapped.  pci_request_regions()
+	 * claims all six, so an unassigned BAR1 became a request_region() at
+	 * port 0, which collides with the legacy DMA range and fails.
+	 */
+	ret = pci_request_selected_regions(pdev, dev->bar_mask, EG_DRV_NAME);
 	if (ret) {
-		dev_err(&pdev->dev, EG_DRV_NAME ": pci_request_regions failed (%d)\n",
-			ret);
+		dev_err(&pdev->dev,
+			EG_DRV_NAME ": pci_request_selected_regions(%#x) failed (%d)\n",
+			dev->bar_mask, ret);
 		goto err_disable;
 	}
 
@@ -2477,7 +2503,7 @@ err_unmap_wb:
 err_unmap:
 	pci_iounmap(pdev, dev->bar);
 err_release:
-	pci_release_regions(pdev);
+	pci_release_selected_regions(pdev, dev->bar_mask);
 err_disable:
 	pci_disable_device(pdev);
 err_free:
@@ -2533,7 +2559,7 @@ static void eg_remove(struct pci_dev *pdev)
 	if (dev->wishbone)
 		pci_iounmap(pdev, dev->wishbone);
 	pci_iounmap(pdev, dev->bar);
-	pci_release_regions(pdev);
+	pci_release_selected_regions(pdev, dev->bar_mask);
 	pci_disable_device(pdev);
 
 	mutex_lock(&eg_bind_lock);
