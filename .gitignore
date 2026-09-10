@@ -22,3 +22,6 @@ eg_date.h
 *~
 *.swp
 .DS_Store
+
+# Written by egtest.sh before each step, so a hang says where it got to.
+egtest-progress.log

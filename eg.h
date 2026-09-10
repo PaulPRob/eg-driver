@@ -120,6 +120,24 @@ extern int eg_debug;
 /**********************************************************
  * PCI interface definitions
  *
+ * The event generator has been built behind three different PCI front ends.
+ * What varies between them is the vendor:device ID, which BAR the register
+ * block lands in, and how the front end's interrupt is delivered:
+ *
+ *   PLX 9030      10b5:9030   BAR2   PCI32 card, legacy INTx
+ *   Wishbone      2321:0002   BAR3   plus a bridge config block in BAR0
+ *   Xilinx PCIe   10ee:0007   BAR0   PCIe card
+ *
+ * The register block below is *mostly* common to all three - same offsets,
+ * same 16-bit width, and 8- and 16-bit accesses were verified to decode
+ * correctly on the PCIe card.  It is not identical, though, and this header
+ * should not be read as if it were.  The board behind the Xilinx front end
+ * here is a V4.1 (PROM: "PCI EVENT GENERATOR V4.1 22-07-2010"), against V3.4
+ * on the PLX card, and at least the master register's reference-FIFO status
+ * bits behave differently: they do not respond to the FIFO at all.  See
+ * GetFifoSize().  Treat anything in this file that is not exercised by a
+ * passing test on the card in front of you as describing the V3.4 board.
+ *
  * PLX_VENDOR_ID:PLX_DEVICE_ID (10b5:9030) is the generic PLX 9030 bridge ID.
  * The ATNF AT Distributed Clock, driven by the separate "atdcif" module, is
  * built on the same carrier and is normally in the same chassis, so it has the
@@ -135,7 +153,18 @@ extern int eg_debug;
  *   Event generator   registers to 0x2e   BAR2 = 0x40 bytes,  PCI class 0880
  *   AT Distributed    registers to 0xd0   BAR2 = 0x400 bytes, PCI class 0680
  *
- * eg_identify() uses both signals.  See the comment on that function.
+ * eg_identify() uses both signals - but only for this ID.  On the Xilinx PCIe
+ * front end the two boards have device IDs of their own, 10ee:0007 for the
+ * event generator and 10ee:0008 for the clock, so there is nothing to
+ * discriminate and neither test is applied; applying them there would reject
+ * the card, because the PCIe core's BAR0 is 8 KiB and its class is 0580.
+ *
+ * On the Wishbone front end both trees declare 2321:0002 and differ only in
+ * which BAR they read (BAR3 here, BAR2 in atdcif).  Whether that is a real
+ * shared ID or a copy-and-paste in one of the two 2.6 sources is not something
+ * this port could establish - there is no Wishbone board on this machine to
+ * test - so that front end is left exactly as it was found, discriminated on
+ * neither signal.  See the comment on eg_identify().
  **********************************************************/
 #define PLX_VENDOR_ID              0x10b5
 #define PLX_DEVICE_ID              0x9030
@@ -147,6 +176,10 @@ extern int eg_debug;
 #define WISHBONE_CONFIG_BAR             0
 #define WISHBONE_CONFIG_SIZE       0x1000
 #define WISHBONE_STRING            "WISHBONE"
+#define XILINX_PCIE_VENDOR_ID      0x10ee
+#define XILINX_PCIE_DEVICE_ID      0x0007
+#define XILINX_PCIE_BAR                 0
+#define XILINX_PCIE_STRING         "XILINX_PCIE"
 
 /*
  * The highest register offset this driver touches is XIS_FE_REG_1 at 0x2e, so
@@ -160,13 +193,39 @@ extern int eg_debug;
 
 /*
  * ...and anything at or above this ceiling is a register window far larger
- * than the event generator's 46-byte register file, which on a mixed host
- * means it is the clock.  See eg_identify().
+ * than the event generator's 46-byte register file, which on the shared PLX
+ * ID means it is the clock.  Applied only to the shared ID: the Xilinx PCIe
+ * core's smallest BAR is 8 KiB, so the window there says nothing about what
+ * is behind it.  See eg_identify().
  */
 #define EG_MAX_REGION_SIZE         0x0100
 
 /* PCI class the event generator's PLX EEPROM programs: system peripheral. */
 #define EG_PCI_CLASS               0x0880
+
+/*
+ * More than this many serviced interrupts in one second is a storm, not work.
+ * The card's real sources top out around a few thousand a second (the FIFO
+ * half-empty interrupt during a fast event load is the busiest), so 20000 is
+ * far above anything legitimate and far below the rate at which a stuck level
+ * interrupt starves the machine.  Override with the storm_limit parameter.
+ */
+#define EG_STORM_LIMIT_DEFAULT     20000
+
+/*
+ * One entry per PCI front end the register block has been built behind.  The
+ * table is eg_card_specs[] in eg.c; probe() looks the bound device up in it
+ * rather than assuming a BAR.
+ */
+struct eg_card_spec {
+	u16		vendor;
+	u16		device;
+	int		bar;		/* which BAR holds the register block */
+	int		config_bar;	/* second BAR to map, or -1 for none */
+	size_t		config_size;	/* how much of it to map */
+	const char	*name;
+	bool		shared_id;	/* ID also used by the AT dist. clock */
+};
 
 /* What the shared carrier's serial-number PROM says.  Logged, not enforced. */
 #define EG_IDENT_SIGNATURE         "EVENT GENERATOR"
@@ -317,9 +376,11 @@ struct eg_user {
 
 struct eg_dev {
 	struct pci_dev		*pdev;
+	const struct eg_card_spec *spec;	/* which PCI front end */
 	void __iomem		*bar;		/* register block */
 	void __iomem		*wishbone;	/* wishbone bridge, or NULL */
 	int			bar_no;
+	int			bar_mask;	/* BARs claimed, for release */
 	const char		*bar_name;
 	resource_size_t		hw_addr;
 	resource_size_t		region_size;
@@ -328,6 +389,24 @@ struct eg_dev {
 
 	int			irq;
 	bool			irq_ok;
+
+	/*
+	 * Interrupt storm guard.  See EGInterrupt() for why this exists and
+	 * what it protects against.  All three are touched only under ->lock.
+	 */
+	unsigned long		storm_window;	/* jiffies at window start */
+	unsigned int		storm_count;	/* serviced within the window */
+	bool			storm_masked;	/* stage 1: masked at the card */
+	bool			irq_shut_down;	/* stage 2: IRQ disabled */
+
+	/*
+	 * Rate limit state for IC_PLLUnlocked.  Driver-private rather than a
+	 * sixth pub.InterruptRate[] slot, because that array's size is part of
+	 * the userspace ABI.  See EGInterrupt().
+	 */
+	unsigned long		pll_rate_jiffies;
+	unsigned int		pll_rate_count;
+	bool			pll_rate_masked; /* we masked it, so we re-arm */
 
 	/*
 	 * Serialises register read-modify-write against the interrupt handler
