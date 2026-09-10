@@ -146,6 +146,9 @@ static int major = EVGEN_MAJOR;
 int eg_debug = DEBUG_OFF;
 static char *slot;
 static bool force;
+static bool nointr;
+static int storm_limit = EG_STORM_LIMIT_DEFAULT;
+static int fifo_size = -1;
 
 module_param(major, int, 0444);
 MODULE_PARM_DESC(major,
@@ -159,6 +162,15 @@ MODULE_PARM_DESC(slot,
 module_param(force, bool, 0444);
 MODULE_PARM_DESC(force,
 		 "[force=1] bind even if the card looks like the AT distributed clock rather than an event generator.  See eg_identify().");
+module_param(nointr, bool, 0444);
+MODULE_PARM_DESC(nointr,
+		 "[nointr=1] do not request the card's IRQ at all.  Every register, ioctl and /proc path still works; anything that waits for an interrupt returns a timeout.  Use this to bring up a card whose interrupt behaviour is not yet trusted - it makes an interrupt storm impossible.");
+module_param(storm_limit, int, 0644);
+MODULE_PARM_DESC(storm_limit,
+		 "[storm_limit=N] treat more than N serviced interrupts in one second as a storm and shut the interrupt down (default 20000; 0 disables the guard).  See EGInterrupt().");
+module_param(fifo_size, int, 0444);
+MODULE_PARM_DESC(fifo_size,
+		 "[fifo_size=N] report N events as the reference FIFO size instead of measuring it.  Measurement does not work on the V4.1 Xilinx PCIe card - see GetFifoSize().");
 
 MODULE_AUTHOR("CSIRO ATNF");
 MODULE_DESCRIPTION("CSIRO ATNF PC Event Generator (EG) PCI Char Driver");
@@ -367,6 +379,28 @@ static int GetEGSerial(struct eg_dev *dev)
 * RETURNS: FIFO size in number of 4-byte events which the FIFO will hold, or
 *          0 if error
 *
+* This does not work on the V4.1 Xilinx PCIe card and returns 0 there.  The
+* fill loop below watches MA_MSRefFifoFull in the master register; on that card
+* the register reads a constant 0xf904 no matter how much is written to the
+* FIFO.  Checked carefully on 2026-09-10 before blaming the hardware:
+*
+*   - 8-bit writes DO decode on that front end.  Byte writes to the high and
+*     low halves of a control register were read back correctly, so the
+*     "byte transfers only" trick this function depends on is not the problem.
+*   - It is not the TOOBIG ceiling either.  400000 byte writes - thirteen
+*     times the limit, and enough for a 100000 event FIFO - moved no status
+*     bit at all, before or after a reference FIFO reset.
+*   - The master register is otherwise live on that card: GetEGSerial() reads
+*     MA_SerNumBit out of it successfully, which is how the PROM string comes
+*     back.  So the register works; these particular bits do not report.
+*
+* That makes it a firmware/register-map difference between the V3.4 board this
+* code was written for and the V4.1 board, and it needs the V4.1 firmware to
+* resolve rather than more experimentation.  Nothing in the driver consumes
+* FifoSize - it is reported to userspace and to /proc and that is all - so the
+* failure is confined to reporting, and "fifo_size=N" states the real value
+* until the detection can be fixed properly.
+*
 *****************************************************************************/
 
 #define TOOBIG 30000
@@ -414,10 +448,12 @@ static int GetFifoSize(struct eg_dev *dev)
  * first, and the 2.6 driver bound whichever PLX 9030 pci_find_device()
  * returned, so on a two-card host which card you got was a coin toss.
  *
- * The obvious check does not work.  The serial-number PROM is part of the
- * shared carrier, so BOTH boards read back "PC EVENT GENERATOR Vx.y ...
- * SNnnnn"; it is logged here because it carries the board serial number, but
- * it cannot be used to tell the two apart.
+ * The obvious check does not work.  Each board has its own serial-number PROM,
+ * but both are programmed with the same carrier product string, so BOTH read
+ * back "PC EVENT GENERATOR Vx.y ... SNnnnn" and only the serial differs
+ * (measured 2026-08-20: event generator SN6316, clock SN6323).  It is logged
+ * here because the serial identifies the board, but the text cannot be used to
+ * tell the two types apart.
  *
  * What can is the size of the register window the PLX serial EEPROM programs
  * into BAR2, which is sized to each board's register map:
@@ -434,8 +470,23 @@ static int GetFifoSize(struct eg_dev *dev)
  * refused only when both say "this is the clock" - and even then "force=1"
  * overrides, with "slot=" to pin the driver to one PCI address.
  *
- * Note that atdcif does not currently make the reciprocal check, so on a host
- * with both cards it is still the load order that decides what atdcif gets.
+ * atdcif_discriminate() in the atdcif driver makes the reciprocal check, so the
+ * pair is order-independent: load the two drivers in either order and each one
+ * gets its own card.
+ *
+ * All of that applies to the PLX carrier and to nothing else.  The Xilinx PCIe
+ * card has its own device ID - 10ee:0007, against the clock's 10ee:0008 - so
+ * there is no ambiguity to resolve, and both signals would give the wrong
+ * answer if they were consulted anyway: the PCIe core's class is 0580 (memory
+ * controller) rather than 0880, and the smallest BAR it will hand out is 8 KiB,
+ * which is far over EG_MAX_REGION_SIZE.  Applying the PLX test to a PCIe card
+ * therefore refuses it with the thoroughly misleading "this is the AT
+ * distributed clock".  The test is gated on spec->shared_id so that it runs
+ * only where the ambiguity actually exists.
+ *
+ * What is checked on every front end is that the register block reads back as
+ * something: the master register reading all ones means nothing is decoding
+ * behind the BAR.
  */
 static int eg_identify(struct eg_dev *dev)
 {
@@ -452,7 +503,7 @@ static int eg_identify(struct eg_dev *dev)
 		return -ENODEV;
 	}
 
-	if (!class_ok && !size_ok) {
+	if (dev->spec->shared_id && !class_ok && !size_ok) {
 		if (!force) {
 			pr_notice(EG_DRV_NAME
 				  ": %s: PCI class %04x with a %llu byte BAR%d - this is the AT distributed clock, not an event generator\n",
@@ -470,10 +521,17 @@ static int eg_identify(struct eg_dev *dev)
 			(unsigned long long)dev->region_size);
 	}
 
-	eg_dbg(DEBUG_CRIT, "identity: class %04x (%s), BAR%d %llu bytes (%s)\n",
-	       class, class_ok ? "expected" : "unexpected", dev->bar_no,
-	       (unsigned long long)dev->region_size,
-	       size_ok ? "expected" : "unexpected");
+	if (dev->spec->shared_id)
+		eg_dbg(DEBUG_CRIT,
+		       "identity: class %04x (%s), BAR%d %llu bytes (%s)\n",
+		       class, class_ok ? "expected" : "unexpected", dev->bar_no,
+		       (unsigned long long)dev->region_size,
+		       size_ok ? "expected" : "unexpected");
+	else
+		eg_dbg(DEBUG_CRIT,
+		       "identity: %s front end, class %04x, BAR%d %llu bytes; ID is not shared with the clock, nothing to discriminate\n",
+		       dev->bar_name, class, dev->bar_no,
+		       (unsigned long long)dev->region_size);
 
 	dev->pub.Status = EG_LD_STATUS_OK;
 
@@ -521,12 +579,35 @@ static void eg_init_hardware(struct eg_dev *dev)
 	eg_readw(dev, XIS_FE_REG_0);
 	eg_readw(dev, XIS_FE_REG_1);
 
-	dev->pub.FifoSize = GetFifoSize(dev);
-	if (dev->pub.FifoSize != 0)
-		pr_info(EG_DRV_NAME ": FIFO size: %d events\n",
+	if (fifo_size >= 0) {
+		dev->pub.FifoSize = fifo_size;
+		pr_info(EG_DRV_NAME
+			": FIFO size: %d events (from the fifo_size parameter; not measured)\n",
 			dev->pub.FifoSize);
-	else
-		pr_warn(EG_DRV_NAME ": FIFO size: NOT AVAILABLE\n");
+	} else {
+		dev->pub.FifoSize = GetFifoSize(dev);
+		if (dev->pub.FifoSize != 0) {
+			pr_info(EG_DRV_NAME ": FIFO size: %d events\n",
+				dev->pub.FifoSize);
+		} else {
+			/*
+			 * Measured on 0000:03:00.0, a V4.1 Xilinx PCIe card,
+			 * 2026-09-10: 400000 byte writes to FIFO_REG+1 moved
+			 * not one bit of the master register - the FIFO status
+			 * bits sat at 0xf904 throughout, before and after a
+			 * reference FIFO reset.  It is not a byte-access
+			 * problem; 8-bit writes to the register file were
+			 * verified to decode correctly on this card.  The
+			 * status bits simply do not report the way the V3.4
+			 * PLX card's register map says they do.  Resolving it
+			 * needs the V4.1 firmware, not more poking.
+			 */
+			pr_warn(EG_DRV_NAME
+				": FIFO size: NOT AVAILABLE - the FIFO full/empty status bits did not respond.\n");
+			pr_warn(EG_DRV_NAME
+				": Nothing in the driver uses this value; it is reported to userspace through EVGEN_GET_FIFO_SIZE and /proc/" EG_DRV_NAME " only.  Use fifo_size=N to report the size this card actually has.\n");
+		}
+	}
 
 	/* reset reference FIFO */
 	eg_writew(dev, MASTER_REG, MA_PLLResetRefFifo | MA_LatePurgeEvent);
@@ -586,6 +667,112 @@ static irqreturn_t EGInterrupt(int irq, void *dev_id)
 	}
 
 	dev->stats.List[STATS_INTERRUPT_COUNT].Value++;
+
+	/*
+	 * ------------------------------------------------------------------
+	 * Interrupt storm guard
+	 * ------------------------------------------------------------------
+	 *
+	 * Everything below acknowledges an interrupt in one of two ways: by
+	 * reading IS_REG, which clears on read, or by clearing the source's
+	 * enable bit in IC_REG.  Both assume the card then drops its interrupt
+	 * line.  If it does not - because a status register does not clear the
+	 * way this driver expects, or because a source is level-sensitive and
+	 * still true - then a shared, level-triggered PCI interrupt re-asserts
+	 * the instant the handler returns, and the machine makes no further
+	 * progress.  No console, no keyboard, no way in: a hard hang.
+	 *
+	 * The kernel's own protection does not cover this case.  note_interrupt()
+	 * only counts handlers that return IRQ_NONE, and a storm here returns
+	 * IRQ_HANDLED every time - the handler genuinely finds work to do on
+	 * each entry.  So the driver has to police itself.
+	 *
+	 * disable_irq_nosync() is the part that actually saves the machine.
+	 * Masking at the card is tried first and is the tidier fix, but it is
+	 * worth nothing if the reason for the storm is that the card is
+	 * ignoring its own mask register.  Turning the line off at the
+	 * interrupt controller works regardless of what the card does, and is
+	 * documented as safe to call from within the handler.
+	 *
+	 * This is deliberately not a recoverable condition.  Interrupts stay
+	 * off until "reset_irq" is written to /proc/eg or the module is
+	 * reloaded, because a card that has stormed once will storm again the
+	 * moment it is re-enabled, and an automatic retry would simply hang
+	 * the machine a little later.
+	 */
+	if (storm_limit > 0 && !dev->irq_shut_down) {
+		if (time_after(jiffies, dev->storm_window + HZ)) {
+			dev->storm_window = jiffies;
+			dev->storm_count = 0;
+			dev->storm_masked = false;
+		}
+		dev->storm_count++;
+
+		/*
+		 * Stage 1: mask every source at the card.  This is the tidy
+		 * fix and it costs nothing to anyone else, so it is always
+		 * tried first.  If the card honours its own mask register the
+		 * storm stops here and no other device is affected.
+		 */
+		if (dev->storm_count > (unsigned int)storm_limit &&
+		    !dev->storm_masked) {
+			eg_writew(dev, IC_REG, 0);
+			eg_writew(dev, XIC_RE_REG_0, 0);
+			eg_writew(dev, XIC_RE_REG_1, 0);
+			eg_writew(dev, XIC_FE_REG_0, 0);
+			eg_writew(dev, XIC_FE_REG_1, 0);
+			dev->storm_masked = true;
+
+			pr_err(EG_DRV_NAME
+			       ": interrupt storm on IRQ %d - more than %d in one second (ICR %04x, ISR %04x).  All sources masked at the card.\n",
+			       dev->irq, storm_limit, icr, isr);
+
+			spin_unlock_irqrestore(&dev->lock, flags);
+			return IRQ_HANDLED;
+		}
+
+		/*
+		 * Stage 2: still storming with every source masked, so the card
+		 * is ignoring its mask register and nothing this driver writes
+		 * will stop it.  Turning the line off at the interrupt
+		 * controller is the only thing left, and it is what keeps the
+		 * machine alive.
+		 *
+		 * The cost is real and is why this is second: the line may be
+		 * shared, and disable_irq_nosync() stops it for every device on
+		 * it, not just this one.  A dead SMBus or USB controller beats
+		 * a machine that has to be power-cycled, but it is not free, so
+		 * it is reached only when masking at the card has demonstrably
+		 * failed.
+		 */
+		if (dev->storm_count > 2u * (unsigned int)storm_limit) {
+			disable_irq_nosync(dev->irq);
+			dev->irq_shut_down = true;
+
+			pr_err(EG_DRV_NAME
+			       ": card is still interrupting with every source masked - it is ignoring its mask register.\n");
+			pr_err(EG_DRV_NAME
+			       ": IRQ %d disabled at the controller to keep the machine alive.  If that line is shared, the devices sharing it have lost their interrupt too.\n",
+			       dev->irq);
+			pr_err(EG_DRV_NAME
+			       ": interrupts stay off until 'reset_irq' is written to /proc/" EG_DRV_NAME " or the module is reloaded.\n");
+
+			/*
+			 * Wake everyone who is waiting, or they will block for
+			 * their full timeout waiting for an interrupt that can
+			 * no longer arrive.
+			 */
+			for (ref = 0; ref < MAX_NUM_EG_USERS; ++ref) {
+				if (dev->users[ref].in_use) {
+					dev->users[ref].pending = true;
+					wake_up_interruptible(&dev->users[ref].wq);
+				}
+			}
+
+			spin_unlock_irqrestore(&dev->lock, flags);
+			return IRQ_HANDLED;
+		}
+	}
 
 	if (isr & IC_FIFOHalfEmpty) {
 		dev->stats.List[STATS_HALF_EMPTY_INTR_COUNT].Value++;
@@ -667,8 +854,35 @@ static irqreturn_t EGInterrupt(int irq, void *dev_id)
 		interrupts_off |= IC_Event;
 	}
 
-	if (isr & IC_PLLUnlocked)
+	/*
+	 * PLL unlocked is not an edge, it is a condition, and on a bench with
+	 * no time reference connected it is true continuously.  Every other
+	 * source here is either masked after it fires or rate limited; this one
+	 * was counted and then left enabled, so an unlocked PLL meant the card
+	 * re-asserted immediately and forever.  On the PCI32 card that was
+	 * never seen because the reference was always live - "PLL Unlocked
+	 * Interrupts: 0" in every log we have.  It is rate limited now, like
+	 * the four error sources above.
+	 *
+	 * The rate state is kept in struct eg_dev and not in the
+	 * pub.InterruptRate[] array the other four use, because that array is
+	 * sized by MAX_NUM_IR_POINTS inside PublicSysInfo_struct - a userspace
+	 * ABI structure whose size is asserted at 192 bytes.  Adding a sixth
+	 * enumerator to size a sixth slot would change that size and break
+	 * every caller of EVGEN_GET_DEVICE_INFO.
+	 */
+	if (isr & IC_PLLUnlocked) {
 		dev->stats.List[STATS_PLL_UNLOCKED_INTR_COUNT].Value++;
+		if (jiffies == dev->pll_rate_jiffies) {
+			if (++dev->pll_rate_count > MAX_INTERRUPT_RATE) {
+				interrupts_off |= IC_PLLUnlocked;
+				dev->pll_rate_masked = true;
+			}
+		} else {
+			dev->pll_rate_jiffies = jiffies;
+			dev->pll_rate_count = 0;
+		}
+	}
 
 	if (isr & IC_1Second) {
 		dev->stats.List[STATS_ONE_SECOND_INTR_COUNT].Value++;
@@ -752,6 +966,20 @@ static irqreturn_t EGInterrupt(int irq, void *dev_id)
 	if ((icr & IC_MissedSync) == 0 &&
 	    jiffies != dev->pub.InterruptRate[IR_MISSED_SYNC].Jiffies)
 		icr |= IC_MissedSync;
+
+	/*
+	 * Re-arm the PLL source only if the rate limiter above is what masked
+	 * it.  The four sources handled just above are re-enabled whenever they
+	 * are found off, which quietly turns them on even when nobody asked for
+	 * them - inherited behaviour, left alone.  Copying it here would be
+	 * actively harmful: it would enable a source that is continuously true
+	 * on a bench with no reference, which is the storm this is meant to
+	 * prevent.
+	 */
+	if (dev->pll_rate_masked && jiffies != dev->pll_rate_jiffies) {
+		icr |= IC_PLLUnlocked;
+		dev->pll_rate_masked = false;
+	}
 
 	/* turn off flagged interrupts */
 	if (interrupts_off != 0) {
@@ -2045,7 +2273,15 @@ static int eg_proc_show(struct seq_file *s, void *v)
 
 	seq_printf(s, "FIFO size: %d events\n", dev->pub.FifoSize);
 	seq_printf(s, "Assigned IRQ: %d%s\n", dev->irq,
-		   dev->irq_ok ? "" : " (NOT REGISTERED)");
+		   dev->irq_ok ? "" :
+		   (nointr ? " (NOT REQUESTED - nointr=1)" : " (NOT REGISTERED)"));
+
+	if (dev->irq_shut_down)
+		seq_printf(s,
+			   "IRQ STATE: SHUT DOWN by the storm guard (more than %d interrupts in one second).\n"
+			   "           All sources are masked and the line is disabled.\n"
+			   "           Write 'reset_irq' to this file to re-enable, or reload the module.\n",
+			   storm_limit);
 	seq_printf(s, "PCI bus addr: %pa  Region: BAR%d, %llu bytes\n",
 		   &dev->hw_addr, dev->bar_no,
 		   (unsigned long long)dev->region_size);
@@ -2139,6 +2375,40 @@ static ssize_t eg_proc_write(struct file *file, const char __user *arg,
 		}
 		spin_unlock_irqrestore(&dev->lock, flags);
 		pr_info(EG_DRV_NAME ": statistics counters reset\n");
+	} else if (strncmp(cmd, "reset_irq", 9) == 0) {
+		struct eg_dev *dev = pde_data(file_inode(file));
+		unsigned long flags;
+		bool was_shut;
+
+		/*
+		 * Recover from the interrupt storm guard.  Every source is
+		 * already masked at the card - the guard did that before it
+		 * disabled the line - so re-enabling here does not immediately
+		 * re-arm whatever was screaming.  Whoever asked for the
+		 * interrupt must ask again.
+		 */
+		spin_lock_irqsave(&dev->lock, flags);
+		was_shut = dev->irq_shut_down;
+		dev->irq_shut_down = false;
+		dev->storm_masked = false;
+		dev->storm_count = 0;
+		dev->storm_window = jiffies;
+		spin_unlock_irqrestore(&dev->lock, flags);
+
+		/*
+		 * enable_irq() only if stage 2 actually disabled the line -
+		 * calling it otherwise unbalances the depth counter.  Stage 1
+		 * leaves the line up, so clearing the counters above is all
+		 * that is needed there.
+		 */
+		if (was_shut) {
+			enable_irq(dev->irq);
+			pr_info(EG_DRV_NAME
+				": IRQ %d re-enabled after storm shutdown\n",
+				dev->irq);
+		} else {
+			pr_info(EG_DRV_NAME ": storm guard counters cleared\n");
+		}
 	} else {
 		return -EINVAL;
 	}
@@ -2247,6 +2517,7 @@ static void eg_init_state(struct eg_dev *dev)
 static const struct pci_device_id eg_id_table[] = {
 	{ PCI_DEVICE(PLX_VENDOR_ID, PLX_DEVICE_ID) },
 	{ PCI_DEVICE(WISHBONE_VENDOR_ID, WISHBONE_DEVICE_ID) },
+	{ PCI_DEVICE(XILINX_PCIE_VENDOR_ID, XILINX_PCIE_DEVICE_ID) },
 	/*
 	 * The 2.6 table also carried { PCI_DEVICE(0, 0) } before its
 	 * terminator.  Vendor 0 is not a valid PCI vendor ID, so it matched
@@ -2255,6 +2526,38 @@ static const struct pci_device_id eg_id_table[] = {
 	{ 0, }
 };
 MODULE_DEVICE_TABLE(pci, eg_id_table);
+
+/*
+ * Which BAR each front end puts the register block in, whether it has a second
+ * BAR to map, and whether the ID is shared with the AT distributed clock.  The
+ * register block itself is identical on all three - see the PCI section of
+ * eg.h.
+ *
+ * This replaces a two-way "if Wishbone ... else PLX" in probe(), whose else
+ * branch silently gave any future front end the PLX's BAR2.  For the Xilinx
+ * PCIe card that meant BAR2, which does not exist there, so probe() failed on
+ * "BAR2 is 0 bytes" - a safe failure, but an obscure one.
+ */
+static const struct eg_card_spec eg_card_specs[] = {
+	{ PLX_VENDOR_ID,	 PLX_DEVICE_ID,		PLX_BAR,	 -1,
+	  0,			  PLX_STRING,		true },
+	{ WISHBONE_VENDOR_ID,	 WISHBONE_DEVICE_ID,	WISHBONE_BAR,	 WISHBONE_CONFIG_BAR,
+	  WISHBONE_CONFIG_SIZE,	  WISHBONE_STRING,	false },
+	{ XILINX_PCIE_VENDOR_ID, XILINX_PCIE_DEVICE_ID,	XILINX_PCIE_BAR, -1,
+	  0,			  XILINX_PCIE_STRING,	false },
+	{ 0, 0, 0, -1, 0, NULL, false }
+};
+
+static const struct eg_card_spec *eg_lookup_spec(struct pci_dev *pdev)
+{
+	const struct eg_card_spec *spec;
+
+	for (spec = eg_card_specs; spec->name; spec++)
+		if (spec->vendor == pdev->vendor && spec->device == pdev->device)
+			return spec;
+
+	return NULL;
+}
 
 static int eg_register_chrdev(struct eg_dev *dev)
 {
@@ -2362,16 +2665,27 @@ static int eg_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	eg_init_state(dev);
 
-	if (pdev->vendor == WISHBONE_VENDOR_ID &&
-	    pdev->device == WISHBONE_DEVICE_ID) {
-		dev->bar_no = WISHBONE_BAR;
-		dev->bar_name = WISHBONE_STRING;
-		dev->bar_mask = (1 << WISHBONE_BAR) | (1 << WISHBONE_CONFIG_BAR);
-	} else {
-		dev->bar_no = PLX_BAR;
-		dev->bar_name = PLX_STRING;
-		dev->bar_mask = (1 << PLX_BAR);
+	dev->spec = eg_lookup_spec(pdev);
+	if (!dev->spec) {
+		/*
+		 * Cannot happen through the normal path - the kernel only
+		 * offers what eg_id_table matches, and every entry there has a
+		 * spec.  Reachable by binding a device by hand through
+		 * /sys/bus/pci/drivers/eg/new_id, which is exactly when
+		 * guessing a BAR is the wrong thing to do.
+		 */
+		dev_err(&pdev->dev,
+			EG_DRV_NAME ": %04x:%04x is not a front end this driver knows; refusing to guess which BAR the registers are in\n",
+			pdev->vendor, pdev->device);
+		ret = -ENODEV;
+		goto err_free;
 	}
+
+	dev->bar_no = dev->spec->bar;
+	dev->bar_name = dev->spec->name;
+	dev->bar_mask = (1 << dev->spec->bar);
+	if (dev->spec->config_bar >= 0)
+		dev->bar_mask |= (1 << dev->spec->config_bar);
 
 	pr_info(EG_DRV_NAME ": probing %s (%04x:%04x) behind %s\n",
 		pci_name(pdev), dev->vendor, dev->device, dev->bar_name);
@@ -2437,13 +2751,13 @@ static int eg_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		(unsigned long long)dev->region_size);
 
 	/* Mod for Wishbone interface (A. Brown) */
-	if (pdev->vendor == WISHBONE_VENDOR_ID) {
-		dev->wishbone = pci_iomap(pdev, WISHBONE_CONFIG_BAR,
-					  WISHBONE_CONFIG_SIZE);
+	if (dev->spec->config_bar >= 0) {
+		dev->wishbone = pci_iomap(pdev, dev->spec->config_bar,
+					  dev->spec->config_size);
 		if (!dev->wishbone) {
 			dev_err(&pdev->dev,
 				EG_DRV_NAME ": cannot map wishbone config BAR%d\n",
-				WISHBONE_CONFIG_BAR);
+				dev->spec->config_bar);
 			ret = -ENOMEM;
 			goto err_unmap;
 		}
@@ -2460,6 +2774,23 @@ static int eg_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto err_unmap_wb;
 
 	dev->irq = pdev->irq;
+
+	/*
+	 * nointr=1 brings the card up with no interrupt handler at all.  Every
+	 * register, ioctl and /proc path still works; the paths that wait for
+	 * an interrupt return their timeout instead.  It exists so that a card
+	 * whose interrupt behaviour is not yet trusted - a new front end, new
+	 * firmware - can be brought up and exercised with no possibility of an
+	 * interrupt storm, because the line is never requested.
+	 */
+	if (nointr) {
+		pr_warn(EG_DRV_NAME
+			": nointr=1: not requesting IRQ %d.  Register and ioctl paths work; anything that waits for an interrupt will time out.\n",
+			dev->irq);
+		dev->irq_ok = false;
+		goto irq_done;
+	}
+
 	ret = request_irq(dev->irq, EGInterrupt, IRQF_SHARED, EG_DRV_NAME, dev);
 	if (ret) {
 		/*
@@ -2477,13 +2808,14 @@ static int eg_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 
 	/* Mod for Wishbone interface (A. Brown) */
-	if (dev->wishbone) {
+	if (dev->wishbone && dev->irq_ok) {
 		u32 dword = eg_wb_readl(dev, WISHBONE_ICR);
 
 		/* enable interrupt propagation on the PCI core, just in case */
 		eg_wb_writel(dev, WISHBONE_ICR, dword | INT_PROP_EN);
 	}
 
+irq_done:
 	dev->proc = proc_create_data(EG_DRV_NAME, 0644, NULL, &eg_proc_ops, dev);
 	if (!dev->proc)
 		pr_warn(EG_DRV_NAME ": unable to create /proc/" EG_DRV_NAME "\n");
@@ -2539,6 +2871,21 @@ static void eg_remove(struct pci_dev *pdev)
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (dev->irq_ok) {
+		/*
+		 * If the storm guard disabled the line, undo that first.
+		 * disable_irq_nosync() raises the irq_desc depth counter and
+		 * free_irq() does not lower it, so leaving it raised would keep
+		 * the line disabled for whoever shares it, and would leave the
+		 * count wrong if this driver were loaded again.
+		 */
+		if (dev->irq_shut_down) {
+			pr_info(EG_DRV_NAME
+				": re-enabling IRQ %d that the storm guard disabled, before releasing it\n",
+				dev->irq);
+			enable_irq(dev->irq);
+			dev->irq_shut_down = false;
+		}
+
 		pr_info(EG_DRV_NAME ": freeing interrupt %d\n", dev->irq);
 		free_irq(dev->irq, dev);
 	}

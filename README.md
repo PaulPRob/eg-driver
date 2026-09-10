@@ -291,6 +291,9 @@ Check with `mokutil --sb-state`.
 | `debug=N` | 0 | 0 silent … 8 everything. **7 and 8 log every register access and will flood the journal.** Writable at runtime via `/sys/module/eg/parameters/debug` (root) or `echo debug=2 > /proc/eg`. |
 | `slot=0000:02:02.0` | unset | Bind only to this PCI address. See §3. |
 | `force=1` | off | Bind even if the card does not look like an event generator. See §3. |
+| `nointr=1` | off | Do not request the card's IRQ at all. Registers, ioctls and `/proc` all work; anything that waits for an interrupt times out. Makes an interrupt storm impossible — use it to bring up a card whose interrupt behaviour is not yet trusted. See §7. |
+| `storm_limit=N` | 20000 | More than N serviced interrupts in one second is treated as a storm. 0 disables the guard. See §7. |
+| `fifo_size=N` | unset | Report N events as the reference FIFO size instead of measuring it. Needed on the V4.1 PCIe card, where measurement does not work — see §6.2. |
 
 `major` and `debug` were `S_IRUGO` in 2.6, so neither could be changed at
 runtime; `iobase` and `irq` are gone with the ISA card.
@@ -342,9 +345,31 @@ single word `eg`.
 
 ---
 
-## 3. Two cards, one PCI ID
+## 3. PCI front ends, and two cards sharing one ID
 
-This is the one thing to understand before deploying.
+The event generator has been built behind three different PCI front ends. What
+varies is the vendor:device ID, which BAR holds the register block, and how the
+interrupt is delivered:
+
+| Front end | ID | BAR | Notes |
+|---|---|---|---|
+| PLX 9030 | `10b5:9030` | BAR2 | PCI32 card. **ID shared with the AT distributed clock** — see below. |
+| Wishbone | `2321:0002` | BAR3 | Plus a bridge config block in BAR0. Not present on this machine; untested. |
+| Xilinx PCIe | `10ee:0007` | BAR0 | PCIe card. The clock's equivalent is `10ee:0008`, so this ID is **not** ambiguous. |
+
+`probe()` looks the bound device up in `eg_card_specs[]` rather than assuming a
+BAR. An ID that is not in that table is refused rather than guessed at, which
+matters if someone binds a device by hand through `new_id`.
+
+The clock-versus-event-generator discrimination described in the rest of this
+section applies **only to `10b5:9030`**, and is gated on a `shared_id` flag in
+that table. Applying it to the PCIe card would reject it outright: the Xilinx
+core's class is `0580`, not `0880`, and its smallest BAR is 8 KiB, which is far
+over `EG_MAX_REGION_SIZE`. Both signals would say "this is the clock".
+
+### The ambiguous case: two cards, one PCI ID
+
+This is the one thing to understand before deploying a PCI32 card.
 
 The event generator and the **AT Distributed Clock** — driven by the separate
 `atdcif` module, ported last week — are built on the same PLX 9030 carrier.
@@ -360,11 +385,15 @@ The kernel offers a matching device to whichever driver is loaded first. The 2.6
 driver had no check at all — it bound whichever PLX 9030 `pci_find_device()`
 returned, which on a two-card host is a coin toss.
 
-**The serial-number PROM does not tell them apart.** It belongs to the shared
-carrier, so both boards read back the same `PC EVENT GENERATOR Vx.y … SNnnnn`
-string. (This is worth stating explicitly because it looks like an obvious
-discriminator and is not: `atdcif` logs that same string when it binds the
-clock, which reads as though it has bound the wrong card.)
+**The serial-number PROM does not tell them apart.** Each board has its own,
+but both are programmed with the same carrier product string — only the serial
+differs. Measured 2026-08-20: `02:02.0` (event generator) reads
+`PC EVENT GENERATOR V3.4 2007-08-14 SN6316`, `02:01.0` (the clock) reads the
+same text with `SN6323`. (This is worth stating explicitly because it looks like
+an obvious discriminator and is not: `atdcif` logs that same product string when
+it binds the clock, which reads as though it has bound the wrong card. The
+serials are stable per board and handy for asset tracking, but they are
+site-specific and no driver can hardcode them.)
 
 What does tell them apart is what the PLX serial EEPROM programs, and it follows
 each board's register map:
@@ -380,13 +409,17 @@ unexpected class still binds as long as its register window is the right size,
 and vice versa. It refuses only when both say "this is the clock", and even then
 `force=1` overrides. `slot=0000:02:02.0` pins the driver to one address.
 
-**`atdcif` does not make the reciprocal check.** On a host with both cards it
-still binds whichever PLX 9030 it is offered first and stops there, so if `eg`
-is ever loaded first and takes the clock's slot, `atdcif` will find nothing.
-Loading `eg` first is safe today because `eg` declines the clock; adding the
-mirror-image test to `atdcif` (accept class `0680` or BAR2 ≥ `0x100`) would make
-the pair order-independent. That is a change to the `atdc` tree and has not been
-made here.
+**`atdcif` now makes the reciprocal check** (added 2026-08-20, in the `atdc`
+tree). `atdcif_discriminate()` accepts a card that looks like the clock on
+either signal — class `0680`, *or* a BAR2 of at least `0x100` — and declines the
+event generator before it claims anything, so the kernel goes on to offer it the
+next matching device. **The pair is order-independent: load `eg` and `atdcif` in
+either order and each gets its own card.**
+
+The one asymmetry is that `atdcif` has no `force=`. It would be unusable there:
+the only card its test refuses has a 64-byte BAR2, which cannot hold the clock's
+`0xd0` byte register block, so there is nothing to bind to. `slot=` covers that
+case instead.
 
 ---
 
@@ -394,8 +427,31 @@ made here.
 
 ```bash
 make && make test
-sudo ./egtest.sh          # add --keep to leave the module loaded
+sudo ./egtest.sh              # stage 1 by default - cannot storm
+sudo ./egtest.sh --stage2     # handler registered, nothing armed
+sudo ./egtest.sh --stage3     # arm a source and wait on it
 ```
+
+**The test is staged, and the stages exist for a reason.** On 2026-09-10 a run
+of the old single-shot script hard-hung this machine: screen on, no keyboard, no
+console, and nothing in the journal, because journald never got to flush. Work
+up the stages on any card whose interrupt behaviour you do not already trust,
+and only move up when the stage below has been clean:
+
+| Stage | What it does | Storm risk |
+|---|---|---|
+| `--stage1` (default) | Loads with `nointr=1`, so the IRQ is never requested. Binding, identity, register file, FIFO sizing, `/proc`, device nodes, open/exclusion rules. | **None** — the line is never requested, so no interrupt from the card can reach the CPU. |
+| `--stage2` | Loads normally with every source masked, then watches for 10 idle seconds. Answers "does this card interrupt when told not to?" | Low, and the storm guard is armed. |
+| `--stage3` | Everything, including raising an interrupt and waiting on one. | Covered by the storm guard. |
+
+Stages 2 and 3 load with `storm_limit=2000` rather than the 20000 default, so
+the guard trips in about 20 ms instead of half a second. Override with
+`EG_STORM_LIMIT=N`, and pass extra insmod arguments with `EG_INSARGS=...`.
+
+Every step writes an fsync'd line to `egtest-progress.log` before it runs. If
+the machine does hang, that file is the only thing that will say where it got
+to — the journal will have lost the last few seconds, and this machine boots
+legacy BIOS so pstore has no backend to record a panic into.
 
 `egtest.sh` is non-interactive and self-contained. It loads the module, checks
 which card it bound and that it is the event-generator-shaped one, checks the
@@ -407,31 +463,61 @@ second opener of a minor is refused, scans `dmesg` for oopses, and unloads.
 It deliberately does not read the interrupt status register at `0x04` — reading
 it clears it.
 
-### Result on this machine, 2026-08-19
+### Result on the PCI32 card, 2026-08-19
 
-28 of 28 checks pass on `6.8.0-136-generic`. The card bound was
-`0000:02:02.0`, `PC EVENT GENERATOR V3.4 2007-08-14 SN6316`, IRQ 18 (shared with
-`i801_smbus`), reference FIFO 1024 events, major 235.
+28 of 28 checks passed on `6.8.0-136-generic`, card `0000:02:02.0`,
+`PC EVENT GENERATOR V3.4 2007-08-14 SN6316`, IRQ 18 (shared with `i801_smbus`),
+reference FIFO 1024 events, major 235. The clock reference was live, so the
+one-second interrupt path was exercised end to end.
 
-The clock reference turned out to be live, so more passed than expected:
+### Result on the PCIe card, 2026-09-10
 
-* `PLL Unlocked Interrupts` stayed at **0**.
-* `One Second Interrupts` incremented once per second, so the interrupt path,
-  the wait path and the wake-up all work end to end.
-* The frame grab returned real frame data rather than timing out.
+Card `0000:03:00.0`, `10ee:0007` behind `XILINX_PCIE`, BAR0 8 KiB, **IRQ 17**,
+major 237, PROM `PCI EVENT GENERATOR V4.1 22-07-2010 SN:EG6403`.
+
+| Stage | Result |
+|---|---|
+| 1 | 29 passed, 1 failed |
+| 2 | 29 passed, 1 failed — card silent for 10 s with all sources masked |
+| 3 | 30 passed, 1 failed, 1 skipped |
+
+The single failure in every stage is the reference FIFO size (§6.2). The skip
+is the one-second interrupt, which needs a time reference that is not connected
+to this bench.
+
+**The interrupt path is proven**, without any external hardware, using the
+internal event interrupt: the card asserted, IRQ 17 counted it, the handler ran,
+decoded the source as internal, and masked it. Repeated five times, five times
+identical. Legacy INTx works on this card and **no MSI change is needed** —
+though the core does implement MSI (`lspci -vv` shows the capability at `[48]`)
+if it is ever wanted.
+
+Two notes for anyone repeating this:
+
+* **`IC_Event` is level sensitive on the event line, not edge triggered.**
+  Assert the line and leave it asserted. An earlier version of this test toggled
+  it 1-0-1-0 and latched an interrupt roughly one run in three, because the
+  pulse width was however long two userspace ioctls happened to take. It
+  reported a broken interrupt path the rest of the time.
+* **Do not use the "PLL locked" bit to decide whether a reference is
+  connected.** On this card the master register reads a constant `0xf904` and
+  that bit is meaningless. Trusting it produced a confident and entirely wrong
+  "the interrupt path is not delivering" on a bench whose lock light was plainly
+  off.
 
 ### If there is no timeframe loaded
 
-Without a time reference several results are expected to look like failures,
-and `egtest.sh` scores them as passes provided they return *promptly*:
+Without a time reference several results are expected to look like failures:
 
-* `PLL Unlocked Interrupts` climbing in `/proc/eg`.
 * `read()` timing out with `-EBUSY` — the frame-loaded interrupt never arrives.
 * `EVGEN_WAIT_ON_INTR` on the 1 second source timing out with `-EAGAIN`.
 * A BAT of zero, or one that does not advance.
 
 The clean timeout is the point: that path is exactly what the lost-wakeup bug
-described in §1.2 used to turn into an indefinite block.
+described in §1.2 used to turn into an indefinite block. The script scores the
+one-second timeout as a **skip, not a pass** — with no reference that source
+proves nothing, and calling it a pass is what let a genuinely dead interrupt
+path hide. The internal event interrupt is what actually tests delivery.
 
 ### Driving `test_eg` from a script
 
@@ -492,7 +578,122 @@ The menu, the tests and the `~/test_eg.dat` parameter file format are unchanged.
 
 ---
 
-## 6. Two fixes in `eg_ioctl.h`
+## 6. The PCIe card
+
+### 6.1 What the port to the PCIe card needed
+
+Three changes, all in `eg.c`/`eg.h`:
+
+* **`10ee:0007` added to `eg_id_table`**, so the module binds at all and
+  `MODULE_DEVICE_TABLE` publishes the alias udev coldplugs.
+* **`eg_card_specs[]` replaces a two-way `if (Wishbone) … else → PLX`.** The
+  `else` branch silently gave any front end it did not recognise the PLX's
+  BAR2. For the PCIe card that meant BAR2, which does not exist there, so
+  probe failed on "BAR2 is 0 bytes" — a safe failure, but an obscure one.
+* **The clock-versus-EG discrimination is gated on `shared_id`.** See §3.
+  Unfixed, it rejected the PCIe card as "this is the AT distributed clock".
+
+What did *not* need changing: the register offsets, the 16-bit accessors, the
+interrupt handler, and the delivery mode. 8- and 16-bit MMIO were both verified
+to decode correctly on the Xilinx core, and legacy INTx works.
+
+### 6.2 Open defect: the reference FIFO size reads 0
+
+`GetFifoSize()` returns 0 on the V4.1 card, so `/proc/eg` and
+`EVGEN_GET_FIFO_SIZE` both report 0 events.
+
+This was chased properly before being written off:
+
+* **It is not byte access.** `GetFifoSize()` fills the FIFO with single byte
+  writes, which is the obvious thing to suspect on an FPGA front end. Byte
+  writes to both halves of a control register were read back correctly on this
+  card, so 8-bit decoding works.
+* **It is not the `TOOBIG` ceiling.** 400000 byte writes — thirteen times the
+  limit, enough for a 100000 event FIFO — moved **not one bit** of the master
+  register, before or after a reference FIFO reset.
+* **The register is otherwise live.** `GetEGSerial()` reads `MA_SerNumBit` out
+  of that same master register successfully; that is how the PROM string comes
+  back. The register works. These particular bits do not report.
+
+So the V3.4 and V4.1 register maps differ, and resolving it needs the V4.1
+firmware rather than more poking. The impact is contained: **nothing in the
+driver consumes `FifoSize`** — it is reported to userspace and to `/proc` and
+that is all — and `fifo_size=N` states the real value in the meantime.
+
+This is also why `eg.h` no longer claims the register block is identical across
+the three front ends. It is *mostly* common, and that is not the same thing.
+
+---
+
+## 7. Interrupt safety
+
+A driver for this card can hang a machine, and one did. The acknowledge path
+assumes that reading `IS_REG` (which clears on read) or clearing a source's
+enable bit in `IC_REG` makes the card drop its interrupt line. If that
+assumption fails — a status register that does not clear the way this driver
+expects, or a source that is level-sensitive and still true — then a
+level-triggered interrupt re-asserts the moment the handler returns, and the
+machine stops making progress. No console, no keyboard, nothing in the log.
+
+**The kernel's own protection does not cover this.** `note_interrupt()` only
+counts handlers that return `IRQ_NONE`, and a storm of this kind returns
+`IRQ_HANDLED` every time — the handler genuinely finds work on each entry. So
+the driver has to police itself.
+
+### The storm guard
+
+`EGInterrupt()` counts serviced interrupts per second and acts in two stages:
+
+1. **Over `storm_limit` in one second → mask every source at the card.** Tidy,
+   and it costs nothing to anything else. If the card honours its own mask
+   register the storm ends here.
+2. **Still storming at twice the limit → `disable_irq_nosync()`.** The card is
+   ignoring its mask register and nothing the driver writes will stop it.
+   Turning the line off at the controller always works, and it is what keeps
+   the machine alive.
+
+Stage 2 is second because it is not free: the line may be shared, and disabling
+it stops every device on it. (On the PCIe card here, IRQ 17 is not shared, so
+it would cost nothing — but that is luck, not design.) A dead SMBus controller
+beats a machine that has to be power-cycled, so it is the right last resort.
+
+Neither stage recovers on its own. A card that has stormed once will storm again
+the moment it is re-enabled, and an automatic retry just hangs the machine a
+little later. `/proc/eg` reports the shutdown; `echo reset_irq > /proc/eg`
+clears it, as does reloading the module. `remove()` re-enables the line before
+`free_irq()`, so the depth counter stays balanced.
+
+### `IC_PLLUnlocked` was a screaming source
+
+Every interrupt source in the handler is either masked after it fires or rate
+limited — except `IC_PLLUnlocked`, which was counted and left enabled. It is a
+*condition*, not an edge: with no time reference connected it is true
+continuously, so the card re-asserted immediately and forever. On the PCI32
+card this never showed, because the reference was always live — "PLL Unlocked
+Interrupts: 0" in every log we have. It is rate limited now.
+
+Its rate state is kept in `struct eg_dev` rather than as a sixth
+`pub.InterruptRate[]` slot, because that array is sized by `MAX_NUM_IR_POINTS`
+inside `PublicSysInfo_struct` — a userspace ABI structure whose size is asserted
+at 192 bytes.
+
+One asymmetry worth knowing: the four error sources are re-enabled whenever the
+handler finds them off, which quietly turns them on even if nobody asked for
+them. That is inherited behaviour and is left alone. The PLL source is
+deliberately **not** copied from it — it re-arms only if the rate limiter is
+what masked it, because unconditionally enabling a source that is continuously
+true on a bare bench is the storm this is meant to prevent.
+
+### Bringing up an untrusted card
+
+`nointr=1` requests no IRQ at all. Every register, ioctl and `/proc` path still
+works and anything that waits for an interrupt times out, so a card whose
+firmware is unknown can be fully exercised with a storm made impossible rather
+than merely unlikely. That is what `egtest.sh --stage1` uses.
+
+---
+
+## 8. Two fixes in `eg_ioctl.h`
 
 Both were macros that expanded to an undefined enumerator, so any file that
 referenced them failed to compile — which is why nothing ever used them:
