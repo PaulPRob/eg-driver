@@ -1,0 +1,19 @@
+# ISE 14.7 build output from implementing eg_pcie.xise.  The top level is EG,
+# so XST, NGDBuild, MAP, PAR, TRCE and BitGen all write EG.* / EG_*.
+# The bitstream EG.bit is ignored too; commit a release with `git add -f`.
+/EG.*
+/EG_*
+/_ngo/
+/_xmsgs/
+/xst/
+/xlnx_auto_0_xdb/
+
+# Project Navigator state, regenerated when the project is opened
+/eg_pcie.gise
+/iseconfig/
+
+# WebTalk usage reports
+/webtalk.log
+/webtalk_pn.xml
+/usage_statistics_webtalk.html
+/par_usage_statistics.html
