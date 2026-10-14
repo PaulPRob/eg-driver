@@ -293,7 +293,7 @@ Check with `mokutil --sb-state`.
 | `force=1` | off | Bind even if the card does not look like an event generator. See §3. |
 | `nointr=1` | off | Do not request the card's IRQ at all. Registers, ioctls and `/proc` all work; anything that waits for an interrupt times out. Makes an interrupt storm impossible — use it to bring up a card whose interrupt behaviour is not yet trusted. See §7. |
 | `storm_limit=N` | 20000 | More than N serviced interrupts in one second is treated as a storm. 0 disables the guard. See §7. |
-| `fifo_size=N` | unset | Report N events as the reference FIFO size instead of measuring it. Needed on the V4.1 PCIe card, where measurement does not work — see §6.2. |
+| `fifo_size=N` | unset | Report N events as the reference FIFO size instead of measuring it. On the V4.1 PCIe card, where it cannot be measured, the driver reports the firmware's 1025 unless this overrides it — see §6.2. |
 
 `major` and `debug` were `S_IRUGO` in 2.6, so neither could be changed at
 runtime; `iobase` and `irq` are gone with the ISA card.
@@ -481,7 +481,8 @@ major 237, PROM `PCI EVENT GENERATOR V4.1 22-07-2010 SN:EG6403`.
 | 2 | 29 passed, 1 failed — card silent for 10 s with all sources masked |
 | 3 | 30 passed, 1 failed, 1 skipped |
 
-The single failure in every stage is the reference FIFO size (§6.2). The skip
+The single failure in every stage is the reference FIFO size (§6.2), which
+the driver now reports from the firmware instead of measuring. The skip
 is the one-second interrupt, which needs a time reference that is not connected
 to this bench.
 
@@ -597,28 +598,44 @@ What did *not* need changing: the register offsets, the 16-bit accessors, the
 interrupt handler, and the delivery mode. 8- and 16-bit MMIO were both verified
 to decode correctly on the Xilinx core, and legacy INTx works.
 
-### 6.2 Open defect: the reference FIFO size reads 0
+### 6.2 The reference FIFO size cannot be measured on the V4.1 card
 
-`GetFifoSize()` returns 0 on the V4.1 card, so `/proc/eg` and
-`EVGEN_GET_FIFO_SIZE` both report 0 events.
+`GetFifoSize()` returned 0 on the V4.1 card, so `/proc/eg` and
+`EVGEN_GET_FIFO_SIZE` both reported 0 events. The driver now does not measure
+on that card; it reports **1025 events**, taken from the firmware
+(`XILINX_PCIE_FIFO_SIZE` in `eg.h`). `fifo_size=N` still overrides it.
 
-This was chased properly before being written off:
+Before the firmware source was available this was chased on the card:
 
-* **It is not byte access.** `GetFifoSize()` fills the FIFO with single byte
-  writes, which is the obvious thing to suspect on an FPGA front end. Byte
-  writes to both halves of a control register were read back correctly on this
-  card, so 8-bit decoding works.
+* **It is not byte access.** Byte writes to both halves of a control register
+  were read back correctly on this card, so 8-bit decoding works.
 * **It is not the `TOOBIG` ceiling.** 400000 byte writes — thirteen times the
-  limit, enough for a 100000 event FIFO — moved **not one bit** of the master
-  register, before or after a reference FIFO reset.
+  limit — moved **not one bit** of the master register, before or after a
+  reference FIFO reset.
 * **The register is otherwise live.** `GetEGSerial()` reads `MA_SerNumBit` out
-  of that same master register successfully; that is how the PROM string comes
-  back. The register works. These particular bits do not report.
+  of that same master register successfully.
 
-So the V3.4 and V4.1 register maps differ, and resolving it needs the V4.1
-firmware rather than more poking. The impact is contained: **nothing in the
-driver consumes `FifoSize`** — it is reported to userspace and to `/proc` and
-that is all — and `fifo_size=N` states the real value in the meantime.
+The firmware (`pcie/`) explains it. The V3.4 PLX board had separate LS and MS
+reference FIFOs, and `GetFifoSize()` fills only the MS one with byte writes so
+that the generator never sees a whole event. The V4.1 board has a single
+64-bit FIFO (`pcie/event_gen.vhd`) and pushes into it only when one write loads
+both the LS and MS bytes — a 16-bit write to `FIFO_REG` — four of which make
+one event. MS-only byte writes never push anything, so the FIFO stays empty and
+"full" never comes. Measuring with whole events would put real events on the
+outputs, so the size comes from the firmware instead:
+
+* The FIFO is `pcie/ipcore_dir/eg_ref_fifo`, a FIFO Generator v5.3 core of
+  1024 × 64 bits, independent clocks, first-word fall-through. Its actual depth
+  in that configuration is 1025 (UG175, "Actual FIFO Depth").
+* `pcie/sim/tb_eventgen.vhd` simulates the driver's writes through the register
+  file and event generator into a model of that FIFO: 1025 events fill it,
+  plus one more that the generator holds as its next event. The one held is not
+  counted, so the figure matches what `GetFifoSize()` measures on the PLX card —
+  the FIFO alone.
+
+A firmware build with a different FIFO needs `XILINX_PCIE_FIFO_SIZE` changed,
+or `fifo_size=N`. Nothing in the driver consumes `FifoSize`; it is reported to
+userspace and to `/proc` only.
 
 This is also why `eg.h` no longer claims the register block is identical across
 the three front ends. It is *mostly* common, and that is not the same thing.

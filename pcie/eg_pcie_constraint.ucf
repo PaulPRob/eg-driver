@@ -1,0 +1,185 @@
+#-------------------------------------------------------------------------------
+# (c) Copyright - Commonwealth Scientific and Industrial Research Organisation
+# (CSIRO) - 2010
+#
+# All Rights Reserved.
+#
+# Restricted Use.
+#
+# Copyright protects this code. Except as permitted by the Copyright Act, you
+# may only use the code as expressly permitted under the terms on which the
+# code was licensed to you.
+#
+#-------------------------------------------------------------------------------
+#
+# File Name:    eg_pcie_constraints.ucf
+# Type:         
+# Designer:     Jesse Kovac
+# Created:       
+# Title:        Spartan-6 Integrated Block for PCI Express
+#
+# Description:  
+#-------------------------------------------------------------------------------
+
+###############################################################################
+# Define Device, Package And Speed Grade
+###############################################################################
+CONFIG PART = xc6slx45t-fgg484-2;
+
+###############################################################################
+# Pinout and Related I/O Constraints
+###############################################################################
+
+NET sys_reset_n      LOC = C20  | IOSTANDARD = LVCMOS33 | PULLUP | NODELAY;
+NET  sys_clk_n       LOC = B10;
+NET  sys_clk_p       LOC = A10;
+
+# PCIe Lane 0
+INST PCIE/s6_pcie_v1_2_i/mgt/GT_i/tile0_gtpa1_dual_wrapper_i/gtpa1_dual_i LOC = GTPA1_DUAL_X0Y0;
+NET   pci_exp_txp  LOC = B6;
+NET   pci_exp_txn  LOC = A6;
+NET   pci_exp_rxp  LOC = D7;
+NET   pci_exp_rxn  LOC = C7;
+
+
+#LED PCIE Debug
+NET   pci_lnk_up_debug_led LOC = H22 | IOSTANDARD=LVCMOS33; 
+
+
+###############################################################################
+# Physical Constraints
+###############################################################################
+
+
+#########################
+#EG System
+#########################
+
+#PLL
+NET "VCO_16M"                 	LOC = P20 | IOSTANDARD=LVCMOS33;
+NET "BAT"                 	LOC = N19 | IOSTANDARD=LVCMOS33;
+NET "UP" 			LOC=F22 | IOSTANDARD=LVCMOS33 | SLEW=SLOW | DRIVE=2;
+NET "DOWN" 			LOC=E22 | IOSTANDARD=LVCMOS33 | SLEW=SLOW | DRIVE=2; 
+
+#TIMING
+NET "T125KHZ"               	LOC = T1 | IOSTANDARD=LVCMOS33;
+NET "T250KHZ"               	LOC = T2 | IOSTANDARD=LVCMOS33;
+NET "T500KHZ"               	LOC = R1 | IOSTANDARD=LVCMOS33;
+NET "CLKD_1MHZ"             	LOC = R3 | IOSTANDARD=LVCMOS33;
+NET "CLKT_1MHZ"             	LOC = P1 | IOSTANDARD=LVCMOS33;
+NET "CLKQ_1MHZ"             	LOC = P2 | IOSTANDARD=LVCMOS33;
+NET "CLKB_2MHZ"             	LOC = N1 | IOSTANDARD=LVCMOS33;
+NET "CLKB_8MHZ"             	LOC = N3 | IOSTANDARD=LVCMOS33;
+
+NET "T8PPMS"              		LOC = AA1 | IOSTANDARD=LVCMOS33;
+NET "SE_EVENT_OUT<11>"        LOC = Y2 | IOSTANDARD=LVCMOS33;
+NET "T16PPMS"               	LOC = Y3 | IOSTANDARD=LVCMOS33;
+NET "SE_EVENT_OUT<10>"        LOC = W1 | IOSTANDARD=LVCMOS33;
+NET "T31PPMS"               	LOC = W3 | IOSTANDARD=LVCMOS33;
+NET "SE_EVENT_OUT<9>"         LOC = V1 | IOSTANDARD=LVCMOS33;
+NET "T62PPMS"               	LOC = V2 | IOSTANDARD=LVCMOS33;
+NET "SE_EVENT_OUT<8>"         LOC = U1 | IOSTANDARD=LVCMOS33;
+
+NET "MSCLK"               		LOC = AA10 | IOSTANDARD=LVCMOS33;
+NET "SE_EVENT_OUT<15>"        LOC = AB9 | IOSTANDARD=LVCMOS33;
+NET "XFS"                 		LOC = Y9 | IOSTANDARD=LVCMOS33;
+NET "SE_EVENT_OUT<14>"        LOC = AB8 | IOSTANDARD=LVCMOS33;
+NET "T2PPMS"              		LOC = AA8 | IOSTANDARD=LVCMOS33;
+NET "SE_EVENT_OUT<13>"        LOC = AB7 | IOSTANDARD=LVCMOS33;
+NET "T4PPMS"              		LOC = AB4 | IOSTANDARD=LVCMOS33;
+NET "SE_EVENT_OUT<12>"        LOC = AA3 | IOSTANDARD=LVCMOS33;
+
+NET "CLKDATA"               	LOC = AA16 | IOSTANDARD=LVCMOS33;
+NET "BUSEVENT"              	LOC = AB15 | IOSTANDARD=LVCMOS33;
+NET "CNTR_OUT"              	LOC = Y15 | IOSTANDARD=LVCMOS33;
+NET "X1SCLK"              		LOC = AB14 | IOSTANDARD=LVCMOS33;
+NET "X1SEC"               		LOC = AA14 | IOSTANDARD=LVCMOS33;
+NET "SE_EVENT_STROBE"         LOC = AB13 | IOSTANDARD=LVCMOS33;
+
+NET "UNUSED_INPUT"            LOC = AA18 | IOSTANDARD=LVCMOS33;
+NET "EXTINT0"               	LOC = AB18 | IOSTANDARD=LVCMOS33;
+NET "EXT_TRIG1"               LOC = Y17 | IOSTANDARD=LVCMOS33;
+NET "EXT_TRIG0"               LOC = AB17 | IOSTANDARD=LVCMOS33;
+NET "CNTR_IN"               	LOC = V17 | IOSTANDARD=LVCMOS33;
+
+NET "U13_DIR_IN"					LOC = Y13 | IOSTANDARD=LVCMOS33;
+NET "U14_DIR_IN"					LOC = AB12 | IOSTANDARD=LVCMOS33;
+NET "U15_DIR_IN"					LOC = AA12 | IOSTANDARD=LVCMOS33;
+NET "U16_DIR_IN"					LOC = AB11 | IOSTANDARD=LVCMOS33;
+NET "U17_DIR_IN"					LOC = Y11 | IOSTANDARD=LVCMOS33;
+
+NET "U13_DIR"						LOC = AB19 | IOSTANDARD=LVCMOS33;
+NET "U14_DIR"						LOC = AB16 | IOSTANDARD=LVCMOS33;
+NET "U15_DIR"						LOC = AB10 | IOSTANDARD=LVCMOS33;
+NET "U16_DIR"						LOC = AA2 | IOSTANDARD=LVCMOS33;
+NET "U17_DIR"						LOC = U3 | IOSTANDARD=LVCMOS33;
+
+#EVENT
+NET "EVENT_OUT<0>"            LOC = E4 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<1>"            LOC = H3 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<2>"            LOC = F3 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<3>"            LOC = J4 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<4>"            LOC = H5 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<5>"            LOC = M5 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<6>"            LOC = K4 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<7>"            LOC = M6 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<8>"            LOC = L4 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<9>"            LOC = N4 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<10>"           LOC = M7 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<11>"           LOC = P3 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<12>"           LOC = M8 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<13>"           LOC = R7 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<14>"           LOC = P4 | IOSTANDARD=LVCMOS33;
+NET "EVENT_OUT<15>"           LOC = W4 | IOSTANDARD=LVCMOS33;
+NET "EVENT_STROBE"            LOC = P5 | IOSTANDARD=LVCMOS33;
+
+#WAVEFORM
+NET "WF_OUT<0>"               LOC = Y22 | IOSTANDARD=LVCMOS33;
+NET "WF_OUT<1>"               LOC = W22 | IOSTANDARD=LVCMOS33;
+NET "WF_OUT<2>"               LOC = V22 | IOSTANDARD=LVCMOS33;
+NET "WF_OUT<3>"               LOC = U22 | IOSTANDARD=LVCMOS33;
+NET "WF_OUT<4>"               LOC = T22 | IOSTANDARD=LVCMOS33;
+NET "WF_OUT<5>"               LOC = R22 | IOSTANDARD=LVCMOS33;
+NET "WF_OUT<6>"               LOC = P22 | IOSTANDARD=LVCMOS33;
+NET "WF_OUT<7>"               LOC = N22 | IOSTANDARD=LVCMOS33;
+
+#LEDS
+NET "RUNNING"               	LOC = K22 | IOSTANDARD=LVCMOS33;
+NET "OUT_OF_LOCK"           	LOC = L22 | IOSTANDARD=LVCMOS33;
+
+#SERIAL ONEWIRE
+NET "SERIAL_ONEWIRE"          LOC = C22 | IOSTANDARD=LVCMOS33;
+
+#REMOTE JTAG INTEFACE
+NET "JTAG_CORE_TDO"  			LOC = B20 | IOSTANDARD=LVCMOS25;
+NET "JTAG_CORE_SELECT" 			LOC = A19 | IOSTANDARD=LVCMOS25;
+	 
+
+###############################################################################
+# Timing Constraints
+###############################################################################
+#
+# Ignore timing on asynchronous signals.
+#
+NET sys_reset_n TIG;
+
+#
+# Timing requirements and related constraints.
+#
+
+# Used because "EXTINT0" isn't on a global clock input
+NET "EXTINT0" CLOCK_DEDICATED_ROUTE = FALSE; 
+
+NET "bat_IBUF"	  PERIOD = 1us;
+NET "Inst_eg_sub_sys/Inst_clocks_gen/sig_count_top(3)"   PERIOD = 1us;
+
+NET "SIG_BCLK"   PERIOD = 16 ns;
+NET "VCO_16M"    PERIOD = 62 ns;
+NET "sys_clk_c"  PERIOD = 10 ns;
+
+NET PCIE/s6_pcie_v1_2_i/gt_refclk_out TNM_NET = GT_REFCLK_OUT;
+TIMESPEC TS_GT_REFCLK_OUT = PERIOD GT_REFCLK_OUT 10ns HIGH 50 % ;
+
+###############################################################################
+# End
+###############################################################################

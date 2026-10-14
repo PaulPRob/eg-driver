@@ -291,7 +291,12 @@ else
 fi
 
 FIFOSRC=$(grep -m1 '^FIFO size:' /proc/eg | awk '{print $3}')
-if [ "${FIFOSRC:-0}" -gt 0 ] 2>/dev/null; then
+if [ "$VID:$DID" = "0x10ee:0x0007" ]; then
+	# Not measured on this card - the driver reports the firmware's value
+	# (XILINX_PCIE_FIFO_SIZE), so a size here says nothing about MMIO.
+	note "FIFO size on the Xilinx PCIe card comes from the firmware, not a"
+	note "measurement - see GetFifoSize() in eg.c."
+elif [ "${FIFOSRC:-0}" -gt 0 ] 2>/dev/null; then
 	note "FIFO sizing works, so 8-bit and 16-bit MMIO both decode: it is"
 	note "measured with byte writes to FIFO_REG+1 and 16-bit reads of the"
 	note "master register.  An FPGA front end that only decoded 32-bit"

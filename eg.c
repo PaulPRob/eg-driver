@@ -170,7 +170,7 @@ MODULE_PARM_DESC(storm_limit,
 		 "[storm_limit=N] treat more than N serviced interrupts in one second as a storm and shut the interrupt down (default 20000; 0 disables the guard).  See EGInterrupt().");
 module_param(fifo_size, int, 0444);
 MODULE_PARM_DESC(fifo_size,
-		 "[fifo_size=N] report N events as the reference FIFO size instead of measuring it.  Measurement does not work on the V4.1 Xilinx PCIe card - see GetFifoSize().");
+		 "[fifo_size=N] report N events as the reference FIFO size instead of measuring it, or instead of the built-in value on the Xilinx PCIe card (1025), where it cannot be measured - see GetFifoSize().");
 
 MODULE_AUTHOR("CSIRO ATNF");
 MODULE_DESCRIPTION("CSIRO ATNF PC Event Generator (EG) PCI Char Driver");
@@ -229,6 +229,30 @@ void eg_writeb(struct eg_dev *dev, unsigned int off, u8 data)
 {
 	writeb(data, dev->bar + off);
 	eg_dbg(DEBUG_PCI, "Wrote 8 bits %02x to +%02x\n", data, off);
+}
+
+/*
+ * eg_readw() for paths that do not already hold dev->lock.  Taking the lock
+ * keeps this read from being in flight at the same time as one from the
+ * interrupt handler on another CPU.  The Xilinx PCIe firmware's PIO engine,
+ * before its TX engine fix, could drop the completion for the second of two
+ * overlapping reads when the PCIe core stalled, leaving that CPU read to end
+ * in a completion timeout.  Firmware with the fix does not need this, but
+ * cards in the field may not have it.  It also stops a read of a
+ * clear-on-read status register
+ * through EG_GET_EG_REG_OP from racing the handler's own read of it.
+ *
+ * Not for callers that hold dev->lock - it is not recursive.
+ */
+static u16 eg_readw_excl(struct eg_dev *dev, unsigned int off)
+{
+	unsigned long flags;
+	u16 p;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	p = eg_readw(dev, off);
+	spin_unlock_irqrestore(&dev->lock, flags);
+	return p;
 }
 
 /* Wishbone bridge registers live in a different BAR and are 32 bits wide. */
@@ -379,27 +403,29 @@ static int GetEGSerial(struct eg_dev *dev)
 * RETURNS: FIFO size in number of 4-byte events which the FIFO will hold, or
 *          0 if error
 *
-* This does not work on the V4.1 Xilinx PCIe card and returns 0 there.  The
-* fill loop below watches MA_MSRefFifoFull in the master register; on that card
-* the register reads a constant 0xf904 no matter how much is written to the
-* FIFO.  Checked carefully on 2026-09-10 before blaming the hardware:
+* This does not work on the V4.1 Xilinx PCIe card and returns 0 there, so
+* probe() does not call it for that card: eg_card_specs[] gives the size from
+* the firmware instead (XILINX_PCIE_FIFO_SIZE).  The fill loop below watches
+* MA_MSRefFifoFull in the master register; on that card the register read a
+* constant 0xf904 no matter how much was written, through 400000 byte writes
+* (2026-09-10).  8-bit writes do decode there, and the master register is
+* otherwise live - GetEGSerial() reads MA_SerNumBit from it.
 *
-*   - 8-bit writes DO decode on that front end.  Byte writes to the high and
-*     low halves of a control register were read back correctly, so the
-*     "byte transfers only" trick this function depends on is not the problem.
-*   - It is not the TOOBIG ceiling either.  400000 byte writes - thirteen
-*     times the limit, and enough for a 100000 event FIFO - moved no status
-*     bit at all, before or after a reference FIFO reset.
-*   - The master register is otherwise live on that card: GetEGSerial() reads
-*     MA_SerNumBit out of it successfully, which is how the PROM string comes
-*     back.  So the register works; these particular bits do not report.
+* The firmware explains it (pcie/event_gen.vhd).  The V4.1 board pushes an
+* entry into its single 64-bit reference FIFO only when one write loads both
+* the LS and MS bytes - a 16-bit write to FIFO_REG - and four such writes make
+* one event.  The MS-only byte writes this loop relies on load the MS byte
+* counter and never push anything, so the FIFO stays empty and "full" never
+* asserts.  Simulated in pcie/sim/tb_eventgen.vhd.  They also leave the LS and
+* MS byte counters out of step, which loses every later event until the FIFO
+* is reset; the reset after the loop takes care of that.
 *
-* That makes it a firmware/register-map difference between the V3.4 board this
-* code was written for and the V4.1 board, and it needs the V4.1 firmware to
-* resolve rather than more experimentation.  Nothing in the driver consumes
-* FifoSize - it is reported to userspace and to /proc and that is all - so the
-* failure is confined to reporting, and "fifo_size=N" states the real value
-* until the detection can be fixed properly.
+* The V3.4 PLX board had separate LS and MS FIFOs, which is what the
+* "Multiply count by 2 ... divide by 8" arithmetic below assumes.  The method
+* is not adapted to V4.1 because the only writes that reach its FIFO are whole
+* events: the generator takes the first as its next event and drives it onto
+* the event outputs when its time comes, which is what the byte-only trick
+* existed to prevent.
 *
 *****************************************************************************/
 
@@ -584,24 +610,22 @@ static void eg_init_hardware(struct eg_dev *dev)
 		pr_info(EG_DRV_NAME
 			": FIFO size: %d events (from the fifo_size parameter; not measured)\n",
 			dev->pub.FifoSize);
+	} else if (dev->spec->fifo_size >= 0) {
+		/*
+		 * Known from the firmware rather than measured: the Xilinx
+		 * PCIe card cannot be measured at all.  See GetFifoSize() and
+		 * XILINX_PCIE_FIFO_SIZE.
+		 */
+		dev->pub.FifoSize = dev->spec->fifo_size;
+		pr_info(EG_DRV_NAME
+			": FIFO size: %d events (fixed for the %s front end; not measured)\n",
+			dev->pub.FifoSize, dev->spec->name);
 	} else {
 		dev->pub.FifoSize = GetFifoSize(dev);
 		if (dev->pub.FifoSize != 0) {
 			pr_info(EG_DRV_NAME ": FIFO size: %d events\n",
 				dev->pub.FifoSize);
 		} else {
-			/*
-			 * Measured on 0000:03:00.0, a V4.1 Xilinx PCIe card,
-			 * 2026-09-10: 400000 byte writes to FIFO_REG+1 moved
-			 * not one bit of the master register - the FIFO status
-			 * bits sat at 0xf904 throughout, before and after a
-			 * reference FIFO reset.  It is not a byte-access
-			 * problem; 8-bit writes to the register file were
-			 * verified to decode correctly on this card.  The
-			 * status bits simply do not report the way the V3.4
-			 * PLX card's register map says they do.  Resolving it
-			 * needs the V4.1 firmware, not more poking.
-			 */
 			pr_warn(EG_DRV_NAME
 				": FIFO size: NOT AVAILABLE - the FIFO full/empty status bits did not respond.\n");
 			pr_warn(EG_DRV_NAME
@@ -1198,7 +1222,7 @@ static ssize_t EGInitiateGrabFrame(struct eg_dev *dev, struct eg_user *u,
 	 */
 	for (n = 0; n < MAX_LENGTH_FRAME; ++n) {
 		udelay(1);
-		dev->frame_data[n] = eg_readw(dev, FIFO_REG);
+		dev->frame_data[n] = eg_readw_excl(dev, FIFO_REG);
 	}
 
 	/* let anyone piggybacking on this operation know */
@@ -1352,7 +1376,7 @@ static ssize_t EGWrite(struct file *filp, const char __user *inbuffer,
 		}
 
 		/* is there room in the FIFO?  If not, wait for half empty. */
-		data = eg_readw(dev, MASTER_REG);
+		data = eg_readw_excl(dev, MASTER_REG);
 
 		if ((data & MA_MSRefFifoFull) == 0) {
 			dev->write_state = WRITE_STATE_FIFO_FULL;
@@ -1394,7 +1418,7 @@ static ssize_t EGWrite(struct file *filp, const char __user *inbuffer,
 				return loops ? (ssize_t)loops : -ERESTARTSYS;
 			}
 
-			data = eg_readw(dev, MASTER_REG);
+			data = eg_readw_excl(dev, MASTER_REG);
 			if ((data & MA_MSRefFifoHalfEmpty) == 0) {
 				pr_warn(EG_DRV_NAME
 					": write: half empty interrupt but FIFO is not half empty\n");
@@ -1645,7 +1669,7 @@ static long EGIoctl(struct file *filp, unsigned int cmd, unsigned long parameter
 		return eg_wait_on_intr(filp, u, &IM);
 
 	case EG_RD_CURRENT_EVENT_OP:
-		data = eg_readw(dev, EVENT_REG);
+		data = eg_readw_excl(dev, EVENT_REG);
 		if (copy_to_user(uarg, &data, sizeof(int)))
 			return -EFAULT;
 		return 0;
@@ -1693,7 +1717,7 @@ static long EGIoctl(struct file *filp, unsigned int cmd, unsigned long parameter
  If the MSB of n is set then the line is not enabled.
 *************************************************************************/
 	case EG_GET_INT_INTR_LINE_OP:
-		data = eg_readw(dev, EVENT_CTRL_REG);
+		data = eg_readw_excl(dev, EVENT_CTRL_REG);
 
 		if ((data & EC_TimeIntEna) == 0)
 			data = ((data & EC_Int_Intr_Sel_Mask) >>
@@ -1769,7 +1793,7 @@ static long EGIoctl(struct file *filp, unsigned int cmd, unsigned long parameter
 		if (reg > LAST_EG_REG)
 			return -EINVAL;
 
-		data = eg_readw(dev, reg);
+		data = eg_readw_excl(dev, reg);
 		data |= (int)(reg << 16);   /* merge address and data */
 
 		if (copy_to_user(uarg, &data, sizeof(int)))
@@ -1792,7 +1816,7 @@ static long EGIoctl(struct file *filp, unsigned int cmd, unsigned long parameter
 		return 0;
 
 	case EG_RD_EV_CNTRL_REG_OP:
-		data = eg_readw(dev, EVENT_CTRL_REG);
+		data = eg_readw_excl(dev, EVENT_CTRL_REG);
 		if (copy_to_user(uarg, &data, sizeof(int)))
 			return -EFAULT;
 		return 0;
@@ -2540,12 +2564,12 @@ MODULE_DEVICE_TABLE(pci, eg_id_table);
  */
 static const struct eg_card_spec eg_card_specs[] = {
 	{ PLX_VENDOR_ID,	 PLX_DEVICE_ID,		PLX_BAR,	 -1,
-	  0,			  PLX_STRING,		true },
+	  0,			  PLX_STRING,		true,	-1 },
 	{ WISHBONE_VENDOR_ID,	 WISHBONE_DEVICE_ID,	WISHBONE_BAR,	 WISHBONE_CONFIG_BAR,
-	  WISHBONE_CONFIG_SIZE,	  WISHBONE_STRING,	false },
+	  WISHBONE_CONFIG_SIZE,	  WISHBONE_STRING,	false,	-1 },
 	{ XILINX_PCIE_VENDOR_ID, XILINX_PCIE_DEVICE_ID,	XILINX_PCIE_BAR, -1,
-	  0,			  XILINX_PCIE_STRING,	false },
-	{ 0, 0, 0, -1, 0, NULL, false }
+	  0,			  XILINX_PCIE_STRING,	false,	XILINX_PCIE_FIFO_SIZE },
+	{ 0, 0, 0, -1, 0, NULL, false, -1 }
 };
 
 static const struct eg_card_spec *eg_lookup_spec(struct pci_dev *pdev)

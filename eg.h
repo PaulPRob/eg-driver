@@ -133,8 +133,9 @@ extern int eg_debug;
  * correctly on the PCIe card.  It is not identical, though, and this header
  * should not be read as if it were.  The board behind the Xilinx front end
  * here is a V4.1 (PROM: "PCI EVENT GENERATOR V4.1 22-07-2010"), against V3.4
- * on the PLX card, and at least the master register's reference-FIFO status
- * bits behave differently: they do not respond to the FIFO at all.  See
+ * on the PLX card, and at least the reference FIFO behaves differently: it
+ * accepts an entry only from a write that carries both the LS and MS bytes,
+ * so the byte writes GetFifoSize() measures with never reach it.  See
  * GetFifoSize().  Treat anything in this file that is not exercised by a
  * passing test on the card in front of you as describing the V3.4 board.
  *
@@ -182,6 +183,19 @@ extern int eg_debug;
 #define XILINX_PCIE_STRING         "XILINX_PCIE"
 
 /*
+ * Reference FIFO size of the Xilinx PCIe card, in events.  It cannot be
+ * measured there (see GetFifoSize()), so it is taken from the firmware: the
+ * FIFO is pcie/ipcore_dir/eg_ref_fifo, a FIFO Generator v5.3 core of 1024 x 64
+ * bits with independent clocks in first-word-fall-through mode, whose actual
+ * depth is 1025 (UG175, "Actual FIFO Depth").  Simulated with
+ * pcie/sim/tb_eventgen.vhd: 1025 events fill it, plus one more held by the
+ * generator as its next event.  That one is not counted, to match what
+ * GetFifoSize() measures on the PLX card - the FIFO alone.  Firmware built with
+ * a different FIFO needs this changed, or fifo_size=N.
+ */
+#define XILINX_PCIE_FIFO_SIZE        1025
+
+/*
  * The highest register offset this driver touches is XIS_FE_REG_1 at 0x2e, so
  * any BAR shorter than 0x30 cannot be the event generator's register block.
  * The 2.6 driver ioremap()'d a fixed 32 bytes (PLX_REGION_SIZE) and then read
@@ -225,6 +239,9 @@ struct eg_card_spec {
 	size_t		config_size;	/* how much of it to map */
 	const char	*name;
 	bool		shared_id;	/* ID also used by the AT dist. clock */
+	int		fifo_size;	/* reference FIFO size in events if it is
+					   known for this front end, or -1 to
+					   measure it with GetFifoSize() */
 };
 
 /* What the shared carrier's serial-number PROM says.  Logged, not enforced. */

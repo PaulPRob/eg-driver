@@ -1,0 +1,8 @@
+# xsim build output from run.sh
+work/
+*.jou
+*.log
+*.pb
+*.wdb
+xsim.dir/
+.Xil/
