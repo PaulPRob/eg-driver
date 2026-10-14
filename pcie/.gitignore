@@ -17,3 +17,7 @@
 /webtalk_pn.xml
 /usage_statistics_webtalk.html
 /par_usage_statistics.html
+
+# Vivado xvhdl run here instead of in sim/ (sim/run.sh is the way)
+/xvhdl.log
+/xvhdl.pb
