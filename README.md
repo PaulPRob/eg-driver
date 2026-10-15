@@ -20,6 +20,9 @@ one `LINUX_VERSION_CODE` left in the tree.
 | `egtest.sh` | Non-interactive hardware check. |
 | `99-eg.rules` | udev ownership for `/dev/eg0..7`. |
 | `dkms.conf` | So the module survives kernel updates. |
+| `pcie/` | Firmware for the Spartan-6 PCIe card: ISE 14.7 project `eg_pcie.xise`, VHDL, constraints. See §6.3–6.5. |
+| `pcie/sim/` | Vivado xsim testbenches for the firmware changes (`./run.sh`). |
+| `pcie/eg_pcie_v1_3.{bit,mcs}` | Firmware release v1.3 (git tag `v1.3`): bitstream and XCF16P PROM image. |
 
 ---
 
@@ -656,6 +659,170 @@ userspace and to `/proc` only.
 
 This is also why `eg.h` no longer claims the register block is identical across
 the three front ends. It is *mostly* common, and that is not the same thing.
+
+### 6.3 Firmware: PCIe front-end fixes
+
+The firmware in `pcie/` is the V4.1 card's Spartan-6 (`xc6slx45t-fgg484-2`)
+design: the Xilinx Spartan-6 Integrated Endpoint (`s6_pcie_v1_2`) with the
+Xilinx PIO example as its application, adapted to drive the EG register file.
+Reviewing it against the driver turned up four faults, all fixed:
+
+| Where | Fault | Fix |
+|---|---|---|
+| `PIO_32_TX_ENGINE.vhd` | A read arriving while a completion was stalled at EOF lost its completion; the host read ended in a completion timeout. | Hold the completion request until the state machine takes it, and signal `compl_done` only once the core has accepted the last DW. |
+| `PIO_32_TX_ENGINE.vhd` | `rd_en` stretched while the core held off DW2, repeating read side effects: frame FIFO pops, ident PROM address increments, clear-on-read interrupt status. | `rd_en` is a single-cycle strobe. |
+| `PIO_32_RX_ENGINE.vhd`, `PIO_32_TX_ENGINE.vhd` | Memory and IO reads of any length but 1 DW were dropped, so the requester waited for a completion that never came. | Answer them with an Unsupported Request completion. |
+| `eg_registers.vhd` | The interrupt enables survived a PCIe reset, so after a warm reboot the card could assert INTx before any driver was loaded. | Clear the interrupt enables on reset. Waveform and event output settings are kept. |
+
+`pcie/sim/tb_pio.vhd` checks the first three against a behavioural model of
+the core's TRN interface: the original RTL drops completions with 2–3 reads
+queued and an EOF stall of 3–5 or more cycles, and the fixed RTL loses none.
+`tb_regs.vhd` checks the reset behaviour. The register map, the 16-bit and
+8-bit decoding the driver relies on (§6.1), and legacy INTx are unchanged.
+
+The driver side of PCIe error reporting (Device Control enables, `DevSta` in
+`/proc/eg`) is in §6.1; it needs no firmware support beyond what the core
+already has.
+
+### 6.4 Firmware: 16 MHz or 50 MHz VCXO
+
+The EG logic runs from 16 MHz: `clocks_gen` divides it by 16 for the 1 MHz
+CLKT, and `pll_pump` phase locks CLKT to BAT by steering the VCXO through
+UP/DOWN. The original card has a 16 MHz VCXO on pin P20 (`VCO_16M`). The
+`VCXO_MHZ` generic on the top level `EG` lets the same design run from a
+50 MHz VCXO instead, by making the 16 MHz with a PLL. `pcie/vcxo_clk.vhd`
+holds both paths:
+
+| `VCXO_MHZ` | Clock path | Used by |
+|---|---|---|
+| `16` (default in `eg.vhd`) | P20 → IBUFG → BUFIO2 → BUFG, exactly as the original firmware. | 16 MHz VCXO cards |
+| `50` | P20 → BUFIO2 → `PLL_BASE` (VCO 800 MHz, CLKOUT0 ÷50) → BUFG | **v1.3**, and what `eg_pcie.xise` is set to |
+
+Any value that divides 800 and is at least 19 (the PLL's minimum input) also
+works: 20, 25, 32, 40, 50. The 16 MHz output is frequency locked to the VCXO,
+so the BAT loop still steers the VCXO through UP/DOWN. The pin keeps its
+`VCO_16M` name whatever the VCXO frequency.
+
+**Choosing it.** The generic is set in ISE under *Synthesize - XST → Process
+Properties → Generics, Parameters*. The committed project has `VCXO_MHZ=50`.
+For a 16 MHz VCXO card, clear the field (or set `VCXO_MHZ=16`) and rebuild.
+**A bitstream built for one VCXO does not work with the other.** A 16 MHz
+build fed 50 MHz runs every EG clock 3.125 times too fast. A 50 MHz build fed
+16 MHz runs the PLL outside its limits (input below its 19 MHz minimum, VCO at
+256 MHz against a 400 MHz minimum), so the 16 MHz clock cannot be trusted even
+if the PLL reports lock.
+
+**Losing and regaining lock.** With the PLL in use:
+
+* `eg_clk_reset` holds `clocks_gen` in reset while the PLL is unlocked, and
+  restarts its 65536-cycle (4.1 ms) hold when it locks again, so `clocks_gen`
+  only ever runs from a stable 16 MHz.
+* A Spartan-6 PLL does not reacquire on its own after losing its input, for
+  example when the VCXO stops or its supply is cycled. A watchdog in
+  `vcxo_clk` clocked by `bclk` (the 62.5 MHz PCIe user clock) pulses the PLL's
+  reset if it stays unlocked for 2^16 cycles (1.05 ms), and keeps doing so
+  until it locks. `bclk` stops while PERST# is asserted, so the watchdog runs
+  whenever the host is out of reset.
+
+With the VCXO used directly, `locked` is tied high and none of this applies.
+
+**Timing constraint.** The 16 MHz period constraint is on `SIG_VCO16M_BUFG`,
+the clock after `vcxo_clk`, rather than on the `VCO_16M` pin. That net is
+16 MHz in both modes; the pin is only 16 MHz when the PLL is not used.
+
+**Checked in the v1.3 build** (ISE 14.7, 2026-10-15): timing met, score 0;
+`SIG_VCO16M_BUFG` worst path 6.241 ns against 62 ns; MAP inserts the BUFIO2
+between the P20 IOB and the PLL (`BUFIO2_X3Y12` → `PLL_ADV_X0Y1`); the PCIe
+core's own PLL is at `PLL_ADV_X0Y2`, so 2 of the 4 PLLs are used.
+
+**Simulated** in `pcie/sim/tb_vcxo.vhd` (`./run.sh vcxo`), which runs
+`eg_sub_sys` with a modelled VCXO steered by UP/DOWN and a 1 MHz BAT, for both
+16 and 50 MHz. Both pass the reset hold, an exact 16 MHz ratio, and the BAT
+loop locking to under 1 ppm. At 50 MHz a 20 µs VCXO dropout loses lock and
+stops the 1 MHz clocks; the watchdog relocks the PLL and the loop locks again.
+Vivado has no Spartan-6 PLL or BUFIO2, so the PLL runs as the retargeted
+7-series MMCM model and `sim/bufio2_sim.vhd` stands in for BUFIO2.
+
+### 6.5 Building the firmware and the PROM image
+
+**Build.** ISE 14.7. In the GUI, open `pcie/eg_pcie.xise` and run *Generate
+Programming File*; the bitstream is `pcie/EG.bit`. From a shell, the same
+project builds with ISE's Tcl shell:
+
+```bash
+source ~/Xilinx/14.7/ISE_DS/settings64.sh
+cd pcie
+xtclsh <<'EOF'
+project open eg_pcie.xise
+process run "Generate Programming File" -force rerun_all
+project close
+EOF
+```
+
+ISE gets its licence from the server in `XILINXD_LICENSE_FILE`. The GUI may
+set this itself where a plain shell does not; if a command-line BitGen stops
+with `ERROR:Bitgen:26` ("only supports DRC but not bitstream generation"),
+export the same value the GUI uses (it is listed in `EG_envsettings.html`).
+Build output in `pcie/` is ignored by `pcie/.gitignore`.
+
+**Configuration speed — why the card was missing at boot.** The FPGA loads
+from an XCF16P Platform Flash, and it has to finish before the BIOS enumerates
+PCIe, roughly 100 ms after reset. The bitstream is 1,485,066 bytes. The
+original firmware used BitGen's default `ConfigRate` of 2 MHz, which is far
+too slow:
+
+| `ConfigRate` | Serial (1 bit) | Master SelectMAP (8 bit) |
+|---|---|---|
+| 2 MHz (original) | 5.9 s | 0.74 s |
+| **16 MHz (now)** | 0.74 s | **93 ms** |
+
+The project now sets *Generate Programming File → Configuration Options →
+Configuration Rate* to 16. Serial loading cannot meet the budget at any rate
+the Spartan-6 offers (26 MHz maximum), so the card must load 8 bits wide.
+93 ms is close to the limit; if a host still misses the card, BitGen's
+*Enable BitStream Compression* shrinks this design to 837,552 bytes, about
+52 ms at 16 MHz. A faster `ConfigRate` is the other lever, but check the
+Spartan-6 CCLK tolerance (DS162) against the XCF16P's maximum clock (DS123)
+first.
+
+**PROM image.** Same `promgen` command as the 2010 v1.0 release (whose `.prm`
+records it):
+
+```bash
+promgen -w -p mcs -c FF -o eg_pcie_v1_3 -x xcf16p -ver 0 eg_pcie_v1_3.bit
+```
+
+The same `.mcs` serves serial and 8-bit loading; the PROM's output mode is set
+when it is programmed.
+
+**Programming the PROM with iMPACT.** Boundary scan finds the xcf16p and the
+xc6slx45t. Assign the `.mcs` to the xcf16p and program it with:
+
+* **Parallel Mode** on, for 8-bit loading.
+* **PROM as configuration Slave.** The FPGA is the configuration master and
+  drives CCLK at the `ConfigRate` above. With the PROM as master its own
+  oscillator sets the speed and `ConfigRate` is ignored.
+* Erase and Verify, revision 0.
+
+Then **switch the host off and on**. The FPGA reloads from the PROM only at
+power-up, and the BIOS has to find the card at boot; a warm reboot or a JTAG
+reconfiguration with the host running leaves the card missing or broken on
+the bus.
+
+**There is no build date in the firmware.** The text the driver prints at
+probe, such as `PCI EVENT GENERATOR V4.1 22-07-2010 SN:EG6403`, comes from the
+board's 1-Wire ident EEPROM: it identifies the board and carries its serial
+number, and reprogramming the FPGA does not change it. The `.bit` header holds
+the build date, but `promgen` drops that header, so it reaches neither the
+PROM nor the FPGA. A release is identified by its file name and git tag
+instead: `pcie/eg_pcie_v1_3.{bit,mcs,prm,cfi,sig}`, tag `v1.3`, PROM checksum
+`0x098E30E5`.
+
+**Simulation.** `pcie/sim/run.sh` runs the five testbenches (`tb_pio`,
+`tb_regs`, `tb_eventgen`, and `tb_vcxo` at 16 and 50 MHz) with the Vivado
+2023.2 simulator; ISE is used only to build. Vivado has no Spartan-6 PCIe or
+GTP model, so the PCIe core itself is not simulated: `tb_pio` drives `PIO_EP`
+through a model of the core's TRN interface.
 
 ---
 
