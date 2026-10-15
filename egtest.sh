@@ -533,13 +533,25 @@ else
 	if [ "$STAGE" -eq 1 ]; then
 		skip "no handler is registered in stage 1, nothing to watch"
 	else
-		egcount() { grep " eg$" /proc/interrupts | awk '{s=0; for(i=2;i<=NF-2;i++) s+=$i; print s}'; }
-		C0=$(egcount)
+		# The pass/fail count is the driver's own "Total Interrupts",
+		# which EGInterrupt() bumps only when the card has a source
+		# both pending and enabled.  The /proc/interrupts count is per
+		# IRQ line, not per handler: with INTx the EG shares its line
+		# (on the bench, IRQ 17 with the ATDC, which ticks at 4 Hz on
+		# its own), so that count rises with every other device's
+		# interrupts and says nothing about this card.
+		IRQ=$(awk '/^Assigned IRQ:/{print $3}' /proc/eg)
+		egcount() { awk -F': ' '/^Total Interrupts:/{print $2}' /proc/eg; }
+		linecount() { awk -v irq="$IRQ:" '$1 == irq {s=0; for(i=2;i<=NF && $i ~ /^[0-9]+$/;i++) s+=$i; print s}' /proc/interrupts; }
+		C0=$(egcount); L0=$(linecount)
 		progress "starting 10s passive interrupt watch"
 		sleep 10
-		C1=$(egcount)
-		note "interrupt count over 10 idle seconds: ${C0:-?} -> ${C1:-?}"
-		progress "passive watch done ($C0 -> $C1)"
+		C1=$(egcount); L1=$(linecount)
+		note "interrupts serviced by eg over 10 idle seconds: ${C0:-?} -> ${C1:-?}"
+		note "IRQ $IRQ line total (all sharers): ${L0:-?} -> ${L1:-?}"
+		SHARERS=$(awk -v irq="$IRQ:" '$1 == irq' /proc/interrupts | sed 's/.*-\(edge\|fasteoi\|level\) *//')
+		[ -n "$SHARERS" ] && note "IRQ $IRQ handlers: $SHARERS"
+		progress "passive watch done (eg $C0 -> $C1, line $L0 -> $L1)"
 
 		if grep -q 'IRQ STATE: SHUT DOWN' /proc/eg; then
 			bad "the storm guard fired with no source armed"
