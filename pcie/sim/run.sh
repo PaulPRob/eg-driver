@@ -9,6 +9,10 @@
 #   ./run.sh eventgen   tb_eventgen - driver event writes through
 #                                 eg_registers and event_gen into the reference
 #                                 FIFO: word order, capacity, drain, reset
+#   ./run.sh vcxo       tb_vcxo - vcxo_clk with VCXO_MHZ = 16 (direct) and
+#                                 50 (PLL): lock, reset hold, 16 MHz ratio, BAT
+#                                 loop lock through eg_sub_sys, VCXO dropout
+#                                 (./run.sh vcxo16 or vcxo50 for one of them)
 #
 # The firmware itself is built with ISE 14.7; Vivado is used only for
 # simulation.  Vivado's UNISIM has no Spartan-6 PCIE_A1 or GTPA1_DUAL, so
@@ -23,6 +27,13 @@
 # (ipcore_dir/eg_ref_fifo, FIFO Generator v5.3) can only be simulated with
 # ISE's XilinxCoreLib, so eg_ref_fifo_sim.vhd maps the same parameters onto
 # the FIFO Generator v13.0 behavioural model that ships with Vivado.
+#
+# Vivado's UNISIM has no Spartan-6 BUFIO2 either, so bufio2_sim.vhd stands
+# in for it (bound by the configuration cfg_tb_vcxo).  Its PLL_BASE is retargeted to a 7-series MMCME2_BASE model,
+# which tb_vcxo uses for the 50 MHz case.
+#
+# Everything is compiled as VHDL-2008, which some firmware files need
+# (expressions in port maps).
 #
 # Build output goes to sim/work/, which is safe to delete.
 
@@ -45,6 +56,7 @@ FIFO_MODEL=$VIVADO/data/ip/xilinx/fifo_generator_v13_0/simulation/fifo_generator
 
 # run_tb <name> <top> <dut sources...>
 #
+# <top> is the testbench: sim/<top>.vhd, elaborated as ELAB_TOP if set.
 # A source written lib=path is compiled into library lib from an absolute
 # path; anything else is relative to the firmware directory.
 run_tb() {
@@ -58,9 +70,9 @@ run_tb() {
 
 	local f libs=()
 	for f in "$@"; do
-		local cmd=(xvhdl "$SRC/$f")
+		local cmd=(xvhdl --2008 "$SRC/$f")
 		if [[ $f == *=* ]]; then
-			cmd=(xvhdl -work "${f%%=*}" "${f#*=}")
+			cmd=(xvhdl --2008 -work "${f%%=*}" "${f#*=}")
 			libs+=(-L "${f%%=*}")
 		fi
 		if ! "${cmd[@]}" >>compile.log 2>&1; then
@@ -74,7 +86,8 @@ run_tb() {
 		grep ERROR compile.log
 		return 1
 	fi
-	if ! xelab -debug off -L unisim "${libs[@]}" "$top" -s "$top" >elab.log 2>&1; then
+	if ! xelab -debug off -L unisim "${libs[@]}" "${ELAB_OPTS[@]}" \
+			"${ELAB_TOP:-$top}" -s "$top" >elab.log 2>&1; then
 		echo "$name: elaboration failed (see $dir/elab.log)"
 		grep ERROR elab.log
 		return 1
@@ -89,6 +102,8 @@ run_tb() {
 
 status=0
 want=${1:-all}
+ELAB_OPTS=()   # extra xelab options for one run_tb
+ELAB_TOP=      # unit to elaborate when it is not $top (a configuration)
 
 if [ "$want" = all ] || [ "$want" = pio ]; then
 	run_tb pio tb_pio \
@@ -110,5 +125,27 @@ if [ "$want" = all ] || [ "$want" = eventgen ]; then
 		async_event_write.vhd eg_registers.vhd \
 		sim/eg_ref_fifo_sim.vhd event_gen.vhd || status=1
 fi
+
+SUB_SYS=(
+	"fifo_generator_v13_0_7=$FIFO_MODEL"
+	utils.vhd pci_package.vhd clocks_package.vhd clk_pulse.vhd
+	control_buffer.vhd delayed_control_buffer.vhd gray_counter.vhd ram.vhd
+	async_fifo.vhd interrupt_buffer.vhd interrupt_status_gen.vhd
+	master_status_gen.vhd sim/eg_ref_fifo_sim.vhd event_gen.vhd
+	frame_gen.vhd pll_detector.vhd pll_pump.vhd timing.vhd
+	waveform_quad.vhd waveform.vhd onewire_clk.vhd onewire_core.vhd
+	onewire_ctrl.vhd ident_write_s_m.vhd ident_read_s_m.vhd
+	ident_serial_read.vhd ident_prom_top.vhd eg_clk_reset.vhd
+	clocks_gen.vhd eg_sub_sys.vhd sim/bufio2_sim.vhd vcxo_clk.vhd
+)
+for mhz in 16 50; do
+	if [ "$want" = all ] || [ "$want" = vcxo ] || [ "$want" = vcxo$mhz ]; then
+		ELAB_OPTS=(--timeprecision_vhdl 1fs -generic_top "VCXO_MHZ=$mhz")
+		ELAB_TOP=cfg_tb_vcxo
+		run_tb vcxo$mhz tb_vcxo "${SUB_SYS[@]}" || status=1
+		ELAB_OPTS=()
+		ELAB_TOP=
+	fi
+done
 
 exit $status

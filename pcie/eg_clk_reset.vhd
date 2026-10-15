@@ -44,6 +44,7 @@ entity eg_clk_reset is
 port(
 
     vco_16m : in  std_logic;
+    locked  : in  std_logic;           -- ATNF MOD FOR EG: vcxo_clk lock
     reset   : out std_logic
 
 );
@@ -57,9 +58,16 @@ architecture behavioral of eg_clk_reset is
 
 begin
 
-process(vco_16m, sig_reset_hold_count, sig_reset)
+-- ATNF MOD FOR EG --
+-- Restart the hold whenever vcxo_clk is out of lock, so clocks_gen only runs
+-- from a stable 16 MHz.  locked is '1' when the VCXO is used directly.
+-- END ATNF MOD --
+process(vco_16m, locked, sig_reset_hold_count, sig_reset)
   begin
-    if rising_edge(vco_16m) then
+    if locked = '0' then
+      sig_reset_hold_count <= (others => '0');
+      sig_reset            <= '1';
+    elsif rising_edge(vco_16m) then
       if sig_reset_hold_count = x"FFFF" then
         sig_reset_hold_count <= sig_reset_hold_count;
         sig_reset            <= '0';

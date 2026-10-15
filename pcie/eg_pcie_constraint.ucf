@@ -174,7 +174,11 @@ NET "bat_IBUF"	  PERIOD = 1us;
 NET "Inst_eg_sub_sys/Inst_clocks_gen/sig_count_top(3)"   PERIOD = 1us;
 
 NET "SIG_BCLK"   PERIOD = 16 ns;
-NET "VCO_16M"    PERIOD = 62 ns;
+# ATNF MOD FOR EG: constrain the 16 MHz clock after vcxo_clk rather than the
+# VCO_16M pin.  It is 16 MHz whatever VCXO_MHZ is set to: the pin itself is
+# only 16 MHz when VCXO_MHZ = 16, and with the PLL in use ISE would derive
+# the 16 MHz period from whatever the pin constraint said.
+NET "SIG_VCO16M_BUFG"  PERIOD = 62 ns;
 NET "sys_clk_c"  PERIOD = 10 ns;
 
 NET PCIE/s6_pcie_v1_2_i/gt_refclk_out TNM_NET = GT_REFCLK_OUT;

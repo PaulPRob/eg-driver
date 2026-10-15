@@ -47,6 +47,7 @@ entity eg_sub_sys is port (
 	 up               : out std_logic;
 	 down             : out std_logic;
 	 vco_16m          : in  std_logic;
+	 vco_locked       : in  std_logic;   -- ATNF MOD FOR EG
 	 
 	 -- Timing --
 	 se_event_out     : out std_logic_vector(15 downto 8);
@@ -175,6 +176,7 @@ begin
 
   Inst_reset_hold : entity eg_clk_reset port map (
     vco_16m => vco_16m,
+    locked  => vco_locked,
     reset   => sig_reset
 	 );
   

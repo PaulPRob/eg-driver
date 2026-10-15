@@ -42,7 +42,11 @@ entity EG is
 
   generic
     (
-      FAST_TRAIN                        : boolean    := FALSE
+      FAST_TRAIN                        : boolean    := FALSE;
+      -- ATNF MOD FOR EG: VCXO frequency on the VCO_16M pin, in MHz.  16
+      -- uses it directly; anything else goes through a PLL to make 16 MHz
+      -- (see vcxo_clk.vhd), e.g. 50 for a 50 MHz VCXO.
+      VCXO_MHZ                          : integer    := 16
       );
 
   port (
@@ -151,9 +155,8 @@ architecture structure of EG is
 
 
   -- EG Signals --
-  signal   sig_vco16m_ibufg : std_logic;
   signal   sig_vco16m_bufg : std_logic;
-  signal   sig_vco16m_bufio2 : std_logic;
+  signal   sig_vco_locked : std_logic;
   signal   sig_bclk : std_logic;
   
   -- EG PCI Signals --
@@ -230,6 +233,7 @@ begin
       up                => up,
       down              => down,
       vco_16m           => sig_vco16m_bufg,
+      vco_locked        => sig_vco_locked,
       
       --Timing --
       clkb_2mhz         => clkb_2mhz,
@@ -460,34 +464,17 @@ begin
   -----------------------------------------------------------
   -- VCO Clock buffers --
   -----------------------------------------------------------
-  vco16m_ibufg : IBUFG
+  -- ATNF MOD FOR EG: buffers moved into vcxo_clk, which adds a PLL when the
+  -- VCXO is not 16 MHz.
+  Inst_vcxo_clk : entity vcxo_clk
     generic map (
-      IBUF_LOW_PWR => TRUE, -- Low power (TRUE) vs. performance (FALSE) setting for referenced I/O standards
-      IOSTANDARD => "DEFAULT")
-    port map (
-      O => sig_vco16m_ibufg, -- Clock buffer output
-      I => VCO_16M  -- Clock buffer input (connect directly to top-level port)
-      );
-
-  vco16m_bufio2 : BUFIO2
-    generic map (
-      DIVIDE => 1,           -- DIVCLK divider (1-8)
-      DIVIDE_BYPASS => TRUE, -- Bypass the divider circuitry (TRUE/FALSE)
-      I_INVERT => FALSE,     -- Invert clock (TRUE/FALSE)
-      USE_DOUBLER => FALSE   -- Use doubler circuitry (TRUE/FALSE)
+      VCXO_MHZ => VCXO_MHZ
       )
     port map (
-      DIVCLK => sig_vco16m_bufio2,             -- 1-bit Divided clock output
-      IOCLK => open,                 -- 1-bit I/O output clock
-      SERDESSTROBE => open,         -- 1-bit Output SERDES strobe (connect to ISERDES/OSERDES)
-      I => sig_vco16m_ibufg         -- 1-bit Clock input (connect to IBUFG)
-      );
-
-
-  vco16m_bufg : BUFG
-    port map (
-      O => sig_vco16m_bufg,     -- Clock buffer output
-      I => sig_vco16m_bufio2      -- Clock buffer input
+      vco_in  => VCO_16M,
+      bclk    => sig_bclk,
+      vco_16m => sig_vco16m_bufg,
+      locked  => sig_vco_locked
       );
 
   
