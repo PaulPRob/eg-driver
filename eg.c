@@ -2261,6 +2261,49 @@ static void eg_proc_decode_icr(struct seq_file *s, unsigned int icr)
 		seq_puts(s, "\n");
 }
 
+#define EG_DEVCTL_ERR_EN	(PCI_EXP_DEVCTL_CERE | PCI_EXP_DEVCTL_NFERE | \
+				 PCI_EXP_DEVCTL_FERE | PCI_EXP_DEVCTL_URRE)
+#define EG_DEVSTA_ERR		(PCI_EXP_DEVSTA_CED | PCI_EXP_DEVSTA_NFED | \
+				 PCI_EXP_DEVSTA_FED | PCI_EXP_DEVSTA_URD)
+
+/*
+ * The card's own record of PCIe errors.  On a host whose root port has no
+ * AER - the 6 Series PCH ports, for one - the error messages the card sends
+ * are dropped, and this is the only place they show up.  The bits are sticky
+ * until written back (RW1C); probe clears them.
+ */
+static void eg_proc_show_devsta(struct seq_file *s, struct pci_dev *pdev)
+{
+	static const struct {
+		u16 bit;
+		const char *name;
+	} bits[] = {
+		{ PCI_EXP_DEVSTA_CED,  "CorrErr" },
+		{ PCI_EXP_DEVSTA_NFED, "NonFatalErr" },
+		{ PCI_EXP_DEVSTA_FED,  "FatalErr" },
+		{ PCI_EXP_DEVSTA_URD,  "UnsupReq" },
+	};
+	u16 sta;
+	int i, m = 0;
+
+	if (!pci_is_pcie(pdev))
+		return;
+
+	if (pcie_capability_read_word(pdev, PCI_EXP_DEVSTA, &sta) ||
+	    sta == (u16)~0) {
+		seq_puts(s, "PCIe DevSta: unreadable\n");
+		return;
+	}
+
+	seq_printf(s, "PCIe DevSta: %04x", sta & EG_DEVSTA_ERR);
+	for (i = 0; i < ARRAY_SIZE(bits); ++i) {
+		if (!(sta & bits[i].bit))
+			continue;
+		seq_printf(s, "%s%s", m++ ? ", " : " ", bits[i].name);
+	}
+	seq_puts(s, m ? "\n" : " (no errors since probe)\n");
+}
+
 static const char *eg_write_state_name(int state)
 {
 	switch (state) {
@@ -2309,6 +2352,7 @@ static int eg_proc_show(struct seq_file *s, void *v)
 	seq_printf(s, "PCI bus addr: %pa  Region: BAR%d, %llu bytes\n",
 		   &dev->hw_addr, dev->bar_no,
 		   (unsigned long long)dev->region_size);
+	eg_proc_show_devsta(s, dev->pdev);
 
 	spin_lock_irqsave(&dev->lock, flags);
 	icr = eg_readw(dev, IC_REG);
@@ -2659,6 +2703,44 @@ static void eg_unregister_chrdev(struct eg_dev *dev)
 	unregister_chrdev_region(dev->devt, MAX_NUM_EG_DEVICES);
 }
 
+/*
+ * The Spartan-6 PCIe block on the PCIe card has no AER capability, and the
+ * kernel only sets the DevCtl error-reporting enables on devices that have
+ * one.  Left alone they stay clear, so the endpoint detects errors (the
+ * DevSta bits still latch) but never sends ERR_COR/ERR_NONFATAL/ERR_FATAL
+ * upstream.  Turn them on here so a root port with AER logs them.  Without
+ * AER on the endpoint the root port can say which device and what severity,
+ * but not which error.
+ *
+ * A no-op on the PLX and Wishbone cards: they are conventional PCI.
+ */
+static void eg_enable_err_reporting(struct pci_dev *pdev)
+{
+	u16 sta;
+
+	if (!pci_is_pcie(pdev))
+		return;
+
+	/* Report, then clear (RW1C), anything latched before we got here */
+	pcie_capability_read_word(pdev, PCI_EXP_DEVSTA, &sta);
+	if (sta & EG_DEVSTA_ERR) {
+		pr_info(EG_DRV_NAME ": DevSta had errors latched at probe: %#06x, clearing\n",
+			sta & EG_DEVSTA_ERR);
+		pcie_capability_write_word(pdev, PCI_EXP_DEVSTA,
+					   sta & EG_DEVSTA_ERR);
+	}
+
+	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, EG_DEVCTL_ERR_EN);
+	pr_info(EG_DRV_NAME ": PCIe error reporting enabled (CorrErr NonFatalErr FatalErr UnsupReq)\n");
+}
+
+static void eg_disable_err_reporting(struct pci_dev *pdev)
+{
+	if (pci_is_pcie(pdev))
+		pcie_capability_clear_word(pdev, PCI_EXP_DEVCTL,
+					   EG_DEVCTL_ERR_EN);
+}
+
 static int eg_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
 	struct eg_dev *dev;
@@ -2736,6 +2818,8 @@ static int eg_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 			ret);
 		goto err_free;
 	}
+
+	eg_enable_err_reporting(pdev);
 
 	/*
 	 * Likewise claim only the BARs actually mapped.  pci_request_regions()
@@ -2861,6 +2945,7 @@ err_unmap:
 err_release:
 	pci_release_selected_regions(pdev, dev->bar_mask);
 err_disable:
+	eg_disable_err_reporting(pdev);
 	pci_disable_device(pdev);
 err_free:
 	kfree(dev);
@@ -2931,6 +3016,7 @@ static void eg_remove(struct pci_dev *pdev)
 		pci_iounmap(pdev, dev->wishbone);
 	pci_iounmap(pdev, dev->bar);
 	pci_release_selected_regions(pdev, dev->bar_mask);
+	eg_disable_err_reporting(pdev);
 	pci_disable_device(pdev);
 
 	mutex_lock(&eg_bind_lock);

@@ -594,6 +594,23 @@ Three changes, all in `eg.c`/`eg.h`:
 * **The clock-versus-EG discrimination is gated on `shared_id`.** See §3.
   Unfixed, it rejected the PCIe card as "this is the AT distributed clock".
 
+Separately, probe sets the four error-reporting enables in the PCIe Device
+Control register (CorrErr, NonFatalErr, FatalErr, UnsupReq), and remove clears
+them. The Spartan-6 PCIe block has no AER capability, and Linux sets these bits
+only on devices that have one, so without this the card never reports an error
+upstream. With it, a root port that has AER logs the error, with its severity
+and the card as the source but not the error type. Errors already latched in
+Device Status at probe are logged and cleared. The PCI cards are unaffected.
+
+Without AER at the root port, as on the 6 Series/C200 PCH ports, those
+messages are dropped. The card's own Device Status register still records
+them, and `/proc/eg` shows it:
+
+    PCIe DevSta: 0000 (no errors since probe)
+    PCIe DevSta: 0009 CorrErr, UnsupReq
+
+The bits stay set until the next probe.
+
 What did *not* need changing: the register offsets, the 16-bit accessors, the
 interrupt handler, and the delivery mode. 8- and 16-bit MMIO were both verified
 to decode correctly on the Xilinx core, and legacy INTx works.
