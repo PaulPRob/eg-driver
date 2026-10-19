@@ -822,13 +822,13 @@ the build date, but `promgen` drops that header, so it reaches neither the
 PROM nor the FPGA. A release is identified by its file name and git tag
 instead:
 
-| VCXO | Files | PROM checksum |
-|---|---|---|
-| 16 MHz | `pcie/eg_pcie_v1_3_16M.{bit,mcs,prm,cfi,sig}` | `0x098DF0E5` |
-| 50 MHz | `pcie/eg_pcie_v1_3_50M.{bit,mcs,prm,cfi,sig}` | `0x098E30E5` |
+| VCXO | Files | Tag | PROM checksum |
+|---|---|---|---|
+| 16 MHz | `pcie/eg_pcie_v1_3_16M.{bit,mcs,prm,cfi,sig}` | `v1.3-16M` | `0x098DF0E5` |
+| 50 MHz | `pcie/eg_pcie_v1_3_50M.{bit,mcs,prm,cfi,sig}` | `v1.3` | `0x098E30E5` |
 
-Tag `v1.3` marks the first 50 MHz release, when its files were still named
-`pcie/eg_pcie_v1_3.*`.
+Tag `v1.3` marks the 50 MHz release when its files were still named
+`pcie/eg_pcie_v1_3.*`; they were renamed `_50M` in the `v1.3-16M` commit.
 
 **Simulation.** `pcie/sim/run.sh` runs the five testbenches (`tb_pio`,
 `tb_regs`, `tb_eventgen`, and `tb_vcxo` at 16 and 50 MHz) with the Vivado
