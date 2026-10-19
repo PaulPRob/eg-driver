@@ -684,6 +684,25 @@ The driver side of PCIe error reporting (Device Control enables, `DevSta` in
 `/proc/eg`) is in §6.1; it needs no firmware support beyond what the core
 already has.
 
+**Blank ident after a cold boot.** Once v1.3 loaded from the PROM at 16 MHz
+(§6.5), `/proc/eg` showed `ID: NOT AVAILABLE`. A bit-by-bit dump of the
+firmware's copy of the ident showed bytes 0–7 (the preamble and `PCI EV`) as
+zeros, with the rest (`ENT GENERATOR V4.1 22-07-2010 SN:EG6403`) intact.
+`ident_read_s_m` read the 1-Wire EEPROM in 8-byte blocks as soon as the PCIe
+reset was released, which now comes so soon after configuration that the
+EEPROM does not answer the first reset pulse. `onewire_ctrl` flagged the error
+on an output nothing was connected to, so the block was stored as zeros and
+never read again. `GetEGSerial()` then found a 0 where the preamble's 1s
+should be and decoded an empty string.
+
+| Where | Fault | Fix |
+|---|---|---|
+| `ident_read_s_m.vhd`, `ident_prom_top.vhd` | The first EEPROM read came too soon after configuration, and a block that failed was stored as zeros without a retry. | Wait 2²⁰ clocks (33.6 ms) after reset before the first read. Connect `onewire_ctrl`'s `error` output and retry a failed block up to 15 times, 2¹⁵ clocks (1.05 ms) apart, before storing it as zeros. |
+
+`pcie/sim/tb_ident.vhd` checks the wait, the retries and their spacing, a
+block that never reads, and that the other blocks are unaffected, against a
+behavioural stand-in for `onewire_ctrl`.
+
 ### 6.4 Firmware: 16 MHz or 50 MHz VCXO
 
 The EG logic runs from 16 MHz: `clocks_gen` divides it by 16 for the 1 MHz
@@ -830,8 +849,8 @@ instead:
 Tag `v1.3` marks the 50 MHz release when its files were still named
 `pcie/eg_pcie_v1_3.*`; they were renamed `_50M` in the `v1.3-16M` commit.
 
-**Simulation.** `pcie/sim/run.sh` runs the five testbenches (`tb_pio`,
-`tb_regs`, `tb_eventgen`, and `tb_vcxo` at 16 and 50 MHz) with the Vivado
+**Simulation.** `pcie/sim/run.sh` runs the six testbenches (`tb_pio`,
+`tb_regs`, `tb_eventgen`, `tb_ident`, and `tb_vcxo` at 16 and 50 MHz) with the Vivado
 2023.2 simulator; ISE is used only to build. Vivado has no Spartan-6 PCIe or
 GTP model, so the PCIe core itself is not simulated: `tb_pio` drives `PIO_EP`
 through a model of the core's TRN interface.

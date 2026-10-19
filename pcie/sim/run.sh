@@ -9,6 +9,8 @@
 #   ./run.sh eventgen   tb_eventgen - driver event writes through
 #                                 eg_registers and event_gen into the reference
 #                                 FIFO: word order, capacity, drain, reset
+#   ./run.sh ident      tb_ident - ident_read_s_m power-up wait and retry of
+#                                 blocks the onewire EEPROM does not answer
 #   ./run.sh vcxo       tb_vcxo - vcxo_clk with VCXO_MHZ = 16 (direct) and
 #                                 50 (PLL): lock, reset hold, 16 MHz ratio, BAT
 #                                 loop lock through eg_sub_sys, VCXO dropout
@@ -124,6 +126,10 @@ if [ "$want" = all ] || [ "$want" = eventgen ]; then
 		control_buffer.vhd delayed_control_buffer.vhd \
 		async_event_write.vhd eg_registers.vhd \
 		sim/eg_ref_fifo_sim.vhd event_gen.vhd || status=1
+fi
+
+if [ "$want" = all ] || [ "$want" = ident ]; then
+	run_tb ident tb_ident ident_read_s_m.vhd || status=1
 fi
 
 SUB_SYS=(

@@ -75,6 +75,7 @@ architecture behavioral of ident_prom_top is
   signal clk                       : std_logic;
   signal sig_empty_write           : std_logic;
   signal sig_running               : std_logic;
+  signal sig_onewire_error         : std_logic;  -- ATNF MOD FOR EG
   signal sig_ident_fifo_dout_write : std_logic_vector(7 downto 0);
   signal sig_strobe                : std_logic;
   signal sig_mode                  : std_logic_vector(1 downto 0);
@@ -118,7 +119,7 @@ begin
               mem_address    => sig_serial_address,
               mem_read_data  => sig_serial_read_data,
               mem_write_data => sig_serial_write_data,
-              error          => open,
+              error          => sig_onewire_error,  -- ATNF MOD FOR EG: was open
               running => sig_running,
               onewire_oe     => onewire_oe,
               onewire_o      => onewire_o,
@@ -165,6 +166,7 @@ begin
               onewire_read_address => sig_read_address,
               onewire_read_strobe  => sig_read_strobe,
               one_wire_running     => sig_running,
+              one_wire_error       => sig_onewire_error,  -- ATNF MOD FOR EG
               re_read_prom         => sig_re_read_prom,
               read_prom_done       => sig_read_prom_done,
               ident_ram_addr_rd    => sig_ident_ram_addr_rd,
