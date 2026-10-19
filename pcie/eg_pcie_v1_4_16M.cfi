@@ -1,0 +1,12 @@
+# PROMGEN: Xilinx Prom Generator P.20131013
+# Copyright (c) 1995-2013 Xilinx, Inc.  All rights reserved.
+
+SOFTWARE_VERSION P.20131013
+DATE            10/19/2026 - 15:29
+SOURCE          eg_pcie_v1_4_16M.mcs
+DEVICE          XCF16P
+DATA_WIDTH      8
+FILL_DATA       0xFF
+SIGNATURE       0x098F2BD6
+BLOCK 0 VERSION 0 0x098F2BD6
+BLOCK 1 VERSION 0 END 0x098F2BD6

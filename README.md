@@ -22,7 +22,8 @@ one `LINUX_VERSION_CODE` left in the tree.
 | `dkms.conf` | So the module survives kernel updates. |
 | `pcie/` | Firmware for the Spartan-6 PCIe card: ISE 14.7 project `eg_pcie.xise`, VHDL, constraints. See §6.3–6.5. |
 | `pcie/sim/` | Vivado xsim testbenches for the firmware changes (`./run.sh`). |
-| `pcie/eg_pcie_v1_3_16M.{bit,mcs}`<br>`pcie/eg_pcie_v1_3_50M.{bit,mcs}` | Firmware release v1.3 for a 16 MHz and a 50 MHz VCXO: bitstream and XCF16P PROM image. |
+| `pcie/eg_pcie_v1_4_16M.{bit,mcs}`<br>`pcie/eg_pcie_v1_4_50M.{bit,mcs}` | Firmware release v1.4 for a 16 MHz and a 50 MHz VCXO: bitstream and XCF16P PROM image. |
+| `pcie/eg_pcie_v1_3_16M.{bit,mcs}`<br>`pcie/eg_pcie_v1_3_50M.{bit,mcs}` | Previous release, v1.3. Loses the ident after a cold boot (§6.3). |
 
 ---
 
@@ -703,6 +704,11 @@ should be and decoded an empty string.
 block that never reads, and that the other blocks are unaffected, against a
 behavioural stand-in for `onewire_ctrl`.
 
+The fix is in **v1.4**. Its wait counter, `sig_wait_count`, is declared with
+the same initial value it is reset to (2²⁰). A Spartan-6 flip-flop's INIT has
+to match its asynchronous reset value; with an initial value of 0, XST built
+bit 20 as a flip-flop plus a latch gated by the PCIe reset (`Xst:1426`).
+
 ### 6.4 Firmware: 16 MHz or 50 MHz VCXO
 
 The EG logic runs from 16 MHz: `clocks_gen` divides it by 16 for the 1 MHz
@@ -715,7 +721,7 @@ holds both paths:
 | `VCXO_MHZ` | Clock path | Used by |
 |---|---|---|
 | `16` (default in `eg.vhd`) | P20 → IBUFG → BUFIO2 → BUFG, exactly as the original firmware. | 16 MHz VCXO cards |
-| `50` | P20 → BUFIO2 → `PLL_BASE` (VCO 800 MHz, CLKOUT0 ÷50) → BUFG | **v1.3**, and what `eg_pcie.xise` is set to |
+| `50` | P20 → BUFIO2 → `PLL_BASE` (VCO 800 MHz, CLKOUT0 ÷50) → BUFG | the `_50M` releases, and what `eg_pcie.xise` is set to |
 
 Any value that divides 800 and is at least 19 (the PLL's minimum input) also
 works: 20, 25, 32, 40, 50. The 16 MHz output is frequency locked to the VCXO,
@@ -811,10 +817,16 @@ records it):
 promgen -w -p mcs -c FF -o EG -x xcf16p -ver 0 EG.bit
 ```
 
-then rename the output with the version and the VCXO frequency, e.g.
-`EG.mcs` to `eg_pcie_v1_3_16M.mcs`. The `.prm` keeps the names promgen was
-given: `EG` for the 16 MHz release, `eg_pcie_v1_3` for the 50 MHz one, which
-was made with `-o eg_pcie_v1_3` before it was renamed.
+For a release, give `-o` the version and the VCXO frequency instead, after
+copying `EG.bit` to the same name:
+
+```bash
+cp EG.bit eg_pcie_v1_4_50M.bit
+promgen -w -p mcs -c FF -o eg_pcie_v1_4_50M -x xcf16p -ver 0 eg_pcie_v1_4_50M.bit
+```
+
+The `.prm` records the names promgen was given. The v1.3 files were renamed
+after promgen, so their `.prm` say `EG` (16 MHz) and `eg_pcie_v1_3` (50 MHz).
 
 The same `.mcs` serves serial and 8-bit loading; the PROM's output mode is set
 when it is programmed.
@@ -843,10 +855,13 @@ instead:
 
 | VCXO | Files | Tag | PROM checksum |
 |---|---|---|---|
+| 16 MHz | `pcie/eg_pcie_v1_4_16M.{bit,mcs,prm,cfi,sig}` | `v1.4-16M` | `0x098F2BD6` |
+| 50 MHz | `pcie/eg_pcie_v1_4_50M.{bit,mcs,prm,cfi,sig}` | `v1.4` | `0x098F63FA` |
 | 16 MHz | `pcie/eg_pcie_v1_3_16M.{bit,mcs,prm,cfi,sig}` | `v1.3-16M` | `0x098DF0E5` |
 | 50 MHz | `pcie/eg_pcie_v1_3_50M.{bit,mcs,prm,cfi,sig}` | `v1.3` | `0x098E30E5` |
 
-Tag `v1.3` marks the 50 MHz release when its files were still named
+v1.4 (2026-10-19) adds the ident fix in §6.3; both v1.4 tags are on the same
+commit. Tag `v1.3` marks the 50 MHz release when its files were still named
 `pcie/eg_pcie_v1_3.*`; they were renamed `_50M` in the `v1.3-16M` commit.
 
 **Simulation.** `pcie/sim/run.sh` runs the six testbenches (`tb_pio`,

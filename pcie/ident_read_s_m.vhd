@@ -111,7 +111,7 @@ architecture behavioral of ident_read_s_m is
   signal sig_onewire_read_strobe : std_logic := '0';
 
   -- ATNF MOD FOR EG --
-  signal sig_wait_count  : integer range 0 to POWERUP_WAIT + RETRY_WAIT := 0;
+  signal sig_wait_count  : integer range 0 to POWERUP_WAIT + RETRY_WAIT := POWERUP_WAIT;
   signal sig_retry_count : integer range 0 to MAX_RETRIES := 0;
   -- END ATNF MOD --
 
