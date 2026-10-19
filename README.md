@@ -22,7 +22,7 @@ one `LINUX_VERSION_CODE` left in the tree.
 | `dkms.conf` | So the module survives kernel updates. |
 | `pcie/` | Firmware for the Spartan-6 PCIe card: ISE 14.7 project `eg_pcie.xise`, VHDL, constraints. See §6.3–6.5. |
 | `pcie/sim/` | Vivado xsim testbenches for the firmware changes (`./run.sh`). |
-| `pcie/eg_pcie_v1_3.{bit,mcs}` | Firmware release v1.3 (git tag `v1.3`): bitstream and XCF16P PROM image. |
+| `pcie/eg_pcie_v1_3_16M.{bit,mcs}`<br>`pcie/eg_pcie_v1_3_50M.{bit,mcs}` | Firmware release v1.3 for a 16 MHz and a 50 MHz VCXO: bitstream and XCF16P PROM image. |
 
 ---
 
@@ -789,8 +789,13 @@ first.
 records it):
 
 ```bash
-promgen -w -p mcs -c FF -o eg_pcie_v1_3 -x xcf16p -ver 0 eg_pcie_v1_3.bit
+promgen -w -p mcs -c FF -o EG -x xcf16p -ver 0 EG.bit
 ```
+
+then rename the output with the version and the VCXO frequency, e.g.
+`EG.mcs` to `eg_pcie_v1_3_16M.mcs`. The `.prm` keeps the names promgen was
+given: `EG` for the 16 MHz release, `eg_pcie_v1_3` for the 50 MHz one, which
+was made with `-o eg_pcie_v1_3` before it was renamed.
 
 The same `.mcs` serves serial and 8-bit loading; the PROM's output mode is set
 when it is programmed.
@@ -815,8 +820,15 @@ board's 1-Wire ident EEPROM: it identifies the board and carries its serial
 number, and reprogramming the FPGA does not change it. The `.bit` header holds
 the build date, but `promgen` drops that header, so it reaches neither the
 PROM nor the FPGA. A release is identified by its file name and git tag
-instead: `pcie/eg_pcie_v1_3.{bit,mcs,prm,cfi,sig}`, tag `v1.3`, PROM checksum
-`0x098E30E5`.
+instead:
+
+| VCXO | Files | PROM checksum |
+|---|---|---|
+| 16 MHz | `pcie/eg_pcie_v1_3_16M.{bit,mcs,prm,cfi,sig}` | `0x098DF0E5` |
+| 50 MHz | `pcie/eg_pcie_v1_3_50M.{bit,mcs,prm,cfi,sig}` | `0x098E30E5` |
+
+Tag `v1.3` marks the first 50 MHz release, when its files were still named
+`pcie/eg_pcie_v1_3.*`.
 
 **Simulation.** `pcie/sim/run.sh` runs the five testbenches (`tb_pio`,
 `tb_regs`, `tb_eventgen`, and `tb_vcxo` at 16 and 50 MHz) with the Vivado
