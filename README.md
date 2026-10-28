@@ -953,3 +953,90 @@ Every command is still encoded with `_IO()`, i.e. with no direction or size in
 the command number even for the ones that take a pointer. That is wrong by
 modern convention, but it is the existing on-the-wire ABI and re-encoding would
 change every command number. Left alone deliberately.
+
+---
+
+## 9. The waveform generator
+
+The card has eight waveform outputs, `wf_out(7:0)`, in two groups of four:
+0–3 and 4–7. Each group has its own 16-bit prescaler, and each output has a
+4-bit source select. The firmware is `pcie/waveform.vhd` and
+`pcie/waveform_quad.vhd`.
+
+### How it runs
+
+The generator runs only while one chosen bit of the current event word is
+high. `EVGEN_WAVEFORM_CONTROL` chooses the bit and `EVGEN_WAVEFORM_ENABLE`
+gates it. While the bit is low, the counters are held in reset and every
+output is 0. When an event sets the bit, all outputs start together, high,
+about 1–2 µs later. So the waveforms are phase-aligned to that event, which
+can be a timed event from the reference FIFO. An event that clears the bit
+stops them. An event that leaves the bit set changes nothing and does not
+re-phase them.
+
+The timebase is one tick per µs. Every PS = prescale + 1 ticks the divider
+steps once, so for source codes 1–8 the period is 2^code × PS µs.
+
+| Code | `eg_ioctl.h` | Output |
+|---|---|---|
+| 0 | `CONT_LO` | 0 |
+| 1 | `FREQ` | period 2·PS µs (500 kHz at prescale 0) |
+| 2–8 | `FREQ_DIV_2` … `FREQ_DIV_128` | `FREQ` ÷ 2 … ÷ 128 |
+| 9 | `FREQ_DIV_16_QUAD` | `FREQ_DIV_16`, shifted 90° |
+| 10 | `FIXED_250K` | fixed clock, see below |
+| 11 | `FIXED_500K` | fixed clock, see below |
+| 14, 15 | `CONT_HI` | 1 |
+
+For example, a 128 ms period on output 0 driven by event bit 5:
+
+```c
+ioctl(fd, EVGEN_SET_PRESCALE_03, 63999);              /* PS = 64 ms */
+ioctl(fd, EVGEN_WAVEFORM_SELECT, (EG_WF0 << 24) | FREQ);
+ioctl(fd, EVGEN_WAVEFORM_CONTROL, 5);
+ioctl(fd, EVGEN_WAVEFORM_ENABLE, 1);
+ioctl(fd, EVGEN_WRITE_EVENT_DIRECT, 1 << 5);          /* start */
+ioctl(fd, EVGEN_WRITE_EVENT_DIRECT, 0);               /* stop */
+```
+
+The bits of the `EVGEN_WAVEFORM_SELECT` argument are: 31:24, a mask of the
+outputs to set (`EG_WF0` … `EG_WF7`); 3:0, the source code.
+
+### The waveform ioctls could not change a setting
+
+All five ioctls ORed the new value into the old one, so bits could be set but
+never cleared. Once a field had been set, setting it to anything else gave
+the OR of the two values. `EVGEN_WAVEFORM_ENABLE, 0` did nothing. Each one
+now clears its own field before writing.
+
+The two prescale ioctls also used to build their register values from
+`lsbPrescaleReg`/`msbPrescaleReg` in `PublicSysInfo_struct`, which start at
+0 when the driver loads. The card keeps its waveform settings across a PCIe
+reset on purpose (`pcie/eg_registers.vhd`), so after a reload, setting one
+group's prescale could rewrite the other group's with 0. They now
+read-modify-write the card's register, as `EVGEN_WAVEFORM_SELECT` already
+did, and keep the two fields up to date for `EVGEN_GET_DEVICE_INFO`.
+
+### Stop the waveform before changing it
+
+The firmware restarts the prescale counter only when it equals the prescale
+value exactly. Suppose you lower the prescale while a waveform is running,
+and the counter is already past the new value. The counter then runs on to
+its 17-bit wrap, which stalls the outputs for up to 2^17 µs, about 131 ms.
+The low and high bytes of the prescale are also written as two separate
+registers, so for about a microsecond the firmware can see half the old
+value and half the new one. To change settings:
+
+1. Stop the waveform: send an event that clears the gating bit, or call
+   `EVGEN_WAVEFORM_ENABLE` with 0.
+2. Change the prescale and source settings.
+3. Start it again with an event that sets the bit. This also resets the
+   counters, so the new waveform starts in phase with that event.
+
+### `FIXED_250K` and `FIXED_500K` look swapped
+
+In `pcie/waveform.vhd`, the generator's `wf_500khz` input is wired to bit 1
+of a counter that steps once per µs, and `wf_250khz` to bit 0. Bit 1 gives
+250 kHz and bit 0 gives 500 kHz. So code 10 (`FIXED_250K`) should come out at
+500 kHz and code 11 (`FIXED_500K`) at 250 kHz. This was read from the source.
+It has not been simulated or checked on a scope, and nothing has been
+changed.

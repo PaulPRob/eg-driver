@@ -1998,20 +1998,24 @@ static long EGIoctl(struct file *filp, unsigned int cmd, unsigned long parameter
 
 	case EG_SET_WFPS_03_OP:
 		spin_lock_irqsave(&dev->lock, flags);
-		dev->pub.lsbPrescaleReg |= parameters & 0x00ff;
+		dev->pub.lsbPrescaleReg = (eg_readw(dev, WFG_PRESCALE_0) & 0xff00) |
+					  (parameters & 0x00ff);
 		eg_writew(dev, WFG_PRESCALE_0, dev->pub.lsbPrescaleReg);
 
-		dev->pub.msbPrescaleReg |= (parameters >> 8) & 0x00ff;
+		dev->pub.msbPrescaleReg = (eg_readw(dev, WFG_PRESCALE_1) & 0xff00) |
+					  ((parameters >> 8) & 0x00ff);
 		eg_writew(dev, WFG_PRESCALE_1, dev->pub.msbPrescaleReg);
 		spin_unlock_irqrestore(&dev->lock, flags);
 		return 0;
 
 	case EG_SET_WFPS_47_OP:
 		spin_lock_irqsave(&dev->lock, flags);
-		dev->pub.lsbPrescaleReg |= (parameters << 8) & 0xff00;
+		dev->pub.lsbPrescaleReg = (eg_readw(dev, WFG_PRESCALE_0) & 0x00ff) |
+					  ((parameters << 8) & 0xff00);
 		eg_writew(dev, WFG_PRESCALE_0, dev->pub.lsbPrescaleReg);
 
-		dev->pub.msbPrescaleReg |= parameters & 0xff00;
+		dev->pub.msbPrescaleReg = (eg_readw(dev, WFG_PRESCALE_1) & 0x00ff) |
+					  (parameters & 0xff00);
 		eg_writew(dev, WFG_PRESCALE_1, dev->pub.msbPrescaleReg);
 		spin_unlock_irqrestore(&dev->lock, flags);
 		return 0;
@@ -2029,28 +2033,28 @@ static long EGIoctl(struct file *filp, unsigned int cmd, unsigned long parameter
 
 			switch (wfnum) {
 			case 0:
-				reg1 |= parameters & 0x000f;
+				reg1 = (reg1 & ~0x000f) | (parameters & 0x000f);
 				break;
 			case 1:
-				reg1 |= (parameters << 4) & 0x00f0;
+				reg1 = (reg1 & ~0x00f0) | ((parameters << 4) & 0x00f0);
 				break;
 			case 2:
-				reg2 |= parameters & 0x000f;
+				reg2 = (reg2 & ~0x000f) | (parameters & 0x000f);
 				break;
 			case 3:
-				reg2 |= (parameters << 4) & 0x00f0;
+				reg2 = (reg2 & ~0x00f0) | ((parameters << 4) & 0x00f0);
 				break;
 			case 4:
-				reg1 |= (parameters << 8) & 0x0f00;
+				reg1 = (reg1 & ~0x0f00) | ((parameters << 8) & 0x0f00);
 				break;
 			case 5:
-				reg1 |= (parameters << 12) & 0xf000;
+				reg1 = (reg1 & ~0xf000) | ((parameters << 12) & 0xf000);
 				break;
 			case 6:
-				reg2 |= (parameters << 8) & 0x0f00;
+				reg2 = (reg2 & ~0x0f00) | ((parameters << 8) & 0x0f00);
 				break;
 			case 7:
-				reg2 |= (parameters << 12) & 0xf000;
+				reg2 = (reg2 & ~0xf000) | ((parameters << 12) & 0xf000);
 				break;
 			}
 		}
@@ -2064,7 +2068,7 @@ static long EGIoctl(struct file *filp, unsigned int cmd, unsigned long parameter
 	case EG_WF_CON_OP:
 		spin_lock_irqsave(&dev->lock, flags);
 		data = eg_readw(dev, EVENT_CTRL_REG);
-		data |= parameters & 0x000f;
+		data = (data & ~0x000f) | (parameters & 0x000f);
 		eg_writew(dev, EVENT_CTRL_REG, data);
 		spin_unlock_irqrestore(&dev->lock, flags);
 		return 0;
@@ -2072,7 +2076,7 @@ static long EGIoctl(struct file *filp, unsigned int cmd, unsigned long parameter
 	case EG_WF_EN_OP:
 		spin_lock_irqsave(&dev->lock, flags);
 		data = eg_readw(dev, EVENT_CTRL_REG);
-		data |= (parameters << 4) & 0x0010;
+		data = (data & ~0x0010) | ((parameters << 4) & 0x0010);
 		eg_writew(dev, EVENT_CTRL_REG, data);
 		spin_unlock_irqrestore(&dev->lock, flags);
 		return 0;
